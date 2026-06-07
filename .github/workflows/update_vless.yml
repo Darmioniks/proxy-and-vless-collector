@@ -1,0 +1,91 @@
+name: Update VLESS Keys
+
+on:
+  schedule:
+    # Runs every 15 minutes
+    - cron: '*/15 * * * *'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  update-vless:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Collect and deduplicate VLESS keys
+        run: |
+          python3 - <<'EOF'
+          import requests
+          import re
+
+          SOURCES = [
+              "https://gitverse.ru/api/repos/cid-uskoritel/cid-white/raw/branch/master/whitelist.txt",
+              "https://gitverse.ru/api/repos/LowiK/LowiKLive/raw/branch/main/ObhodBSfree.txt",
+              "https://gitverse.ru/api/repos/bywarm/rser/raw/branch/master/selected.txt",
+          ]
+
+          unique_vless = set()
+          stats = {}
+
+          for url in SOURCES:
+              source_name = url.split("/")[-1]
+              try:
+                  resp = requests.get(url, timeout=15)
+                  resp.raise_for_status()
+                  text = resp.text
+                  found = 0
+                  for line in text.splitlines():
+                      line = line.strip()
+                      if line.startswith("vless://"):
+                          unique_vless.add(line)
+                          found += 1
+                  stats[source_name] = found
+                  print(f"✅ {source_name}: found {found} vless keys")
+              except Exception as e:
+                  print(f"❌ {source_name}: {e}")
+                  stats[source_name] = 0
+
+          total = len(unique_vless)
+          print(f"\nTotal unique VLESS keys: {total}")
+
+          from datetime import datetime, timezone
+          now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+          header = f"""#profile-title: VLESS Keys Aggregator
+          #profile-update-interval: 1
+          #last-updated: {now}
+          #total-keys: {total}
+          """
+          header = "\n".join(line.strip() for line in header.strip().splitlines())
+
+          with open("vless.txt", "w", encoding="utf-8") as f:
+              f.write(header + "\n\n")
+              for key in sorted(unique_vless):
+                  f.write(key + "\n")
+
+          print(f"vless.txt written with {total} unique keys.")
+          EOF
+
+      - name: Commit and push vless.txt
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add vless.txt
+          if git diff --staged --quiet; then
+            echo "No changes to vless.txt, skipping commit."
+          else
+            git commit -m "chore: update vless.txt [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+            git push
+          fi
