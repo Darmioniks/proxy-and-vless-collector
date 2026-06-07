@@ -34,6 +34,14 @@ jobs:
               "https://gitverse.ru/api/repos/cid-uskoritel/cid-white/raw/branch/master/whitelist.txt",
               "https://gitverse.ru/api/repos/LowiK/LowiKLive/raw/branch/main/ObhodBSfree.txt",
               "https://gitverse.ru/api/repos/bywarm/rser/raw/branch/master/selected.txt",
+              "https://nowmeow.pw/8ybBd3fdCAQ6Ew5H0d66Y1hMbh63GpKUtEXQClIu/whitelist",
+              "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-checked.txt",
+              "https://raw.githubusercontent.com/AvenCores/goida-vpn-configs/refs/heads/main/githubmirror/26.txt",
+              "https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt",
+              "https://wlrus.lol/confs/merged.txt",
+              "https://wlrus.lol/confs/selected.txt",
+              "https://raw.githubusercontent.com/Sanuyyq/sub-storage1/refs/heads/main/bs.txt",
+              "https://raw.githubusercontent.com/Sanuyyq/sub-storage1/refs/heads/main/update.txt",
           ]
 
           unique_vless = set()
