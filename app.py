@@ -185,50 +185,36 @@ with tab_vless:
     if 'vless_loaded' not in st.session_state:
         st.session_state.vless_loaded = False
 
-    col_btn1, col_btn2 = st.columns([3, 1])
-    with col_btn1:
-        if st.button("Загрузить / Обновить VLESS ключи", use_container_width=True, key="btn_vless"):
-            with st.spinner("Загружаем ключи из источников..."):
-                unique_vless = set()
-                source_stats = {}
+    if st.button("🔄 Загрузить / Обновить VLESS ключи", use_container_width=True, key="btn_vless"):
+        with st.spinner("Загружаем ключи из источников..."):
+            unique_vless = set()
+            source_stats = {}
 
-                for url in VLESS_SOURCES:
-                    source_name = url.split("/")[-1]
-                    try:
-                        response = requests.get(url, timeout=10)
-                        if response.status_code == 200:
-                            count = 0
-                            for line in response.text.splitlines():
-                                line = line.strip()
-                                if line.startswith("vless://"):
-                                    unique_vless.add(line)
-                                    count += 1
-                            source_stats[source_name] = count
-                        else:
-                            source_stats[source_name] = 0
-                    except Exception:
+            for url in VLESS_SOURCES:
+                source_name = url.split("/")[-1]
+                try:
+                    response = requests.get(url, timeout=10)
+                    if response.status_code == 200:
+                        count = 0
+                        for line in response.text.splitlines():
+                            line = line.strip()
+                            if line.startswith("vless://"):
+                                unique_vless.add(line)
+                                count += 1
+                        source_stats[source_name] = count
+                    else:
                         source_stats[source_name] = 0
+                except Exception:
+                    source_stats[source_name] = 0
 
-                st.session_state.vless_keys = sorted(unique_vless)
-                st.session_state.vless_loaded = True
+            st.session_state.vless_keys = sorted(unique_vless)
+            st.session_state.vless_loaded = True
 
-                # Показываем статистику по источникам
-                stats_msg = "✅ Загружено из источников: " + " | ".join(
-                    f"**{k}**: {v}" for k, v in source_stats.items()
-                )
-                st.success(stats_msg)
-
-    with col_btn2:
-        if st.session_state.vless_keys:
-            all_keys_text = "\n".join(st.session_state.vless_keys)
-            st.download_button(
-                label="⬇️ Скачать всё",
-                data=all_keys_text,
-                file_name="vless_keys.txt",
-                mime="text/plain",
-                use_container_width=True,
-                key="btn_download_vless"
+            # Показываем статистику по источникам
+            stats_msg = "✅ Загружено из источников: " + " | ".join(
+                f"**{k}**: {v}" for k, v in source_stats.items()
             )
+            st.success(stats_msg)
 
     st.markdown("---")
 
@@ -298,6 +284,17 @@ with tab_vless:
 
         st.markdown("---")
         st.markdown("### Все ключи (для быстрого копирования)")
+
+        all_keys_bytes = "\n".join(st.session_state.vless_keys).encode("utf-8")
+        st.download_button(
+            label="⬇️ Скачать все ключи (vless_keys.txt)",
+            data=all_keys_bytes,
+            file_name="vless_keys.txt",
+            mime="text/plain; charset=utf-8",
+            use_container_width=True,
+            key="btn_download_vless"
+        )
+
         st.text_area(
             label="Все уникальные VLESS ключи",
             value="\n".join(st.session_state.vless_keys),
