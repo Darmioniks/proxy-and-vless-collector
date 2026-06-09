@@ -1,0 +1,62 @@
+name: Filter VLESS (TCP → TLS → Xray)
+
+on:
+  schedule:
+    # Каждый час (UTC). GitHub может задержать запуск при высокой нагрузке.
+    - cron: "0 * * * *"
+  workflow_dispatch: {}        # ручной запуск из вкладки Actions
+
+# Чтобы workflow мог делать commit/push в репозиторий
+permissions:
+  contents: write
+
+# Не запускать несколько прогонов одновременно
+concurrency:
+  group: filter-vless
+  cancel-in-progress: false
+
+jobs:
+  filter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        run: pip install "requests[socks]"
+
+      - name: Install Xray-core
+        run: |
+          set -e
+          mkdir -p "$HOME/xraybin"
+          cd "$HOME/xraybin"
+          curl -fsSL -o xray.zip \
+            https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -o xray.zip
+          chmod +x xray
+          echo "$HOME/xraybin" >> "$GITHUB_PATH"
+
+      - name: Run cascade filter
+        run: |
+          python filter_vless.py \
+            --input vless.txt \
+            --output vless_filtered.txt \
+            --count 10
+
+      - name: Commit & push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add vless_filtered.txt
+          if git diff --staged --quiet; then
+            echo "Изменений нет — коммит не нужен"
+          else
+            git commit -m "chore: обновление vless_filtered.txt [skip ci]"
+            git push
+          fi
