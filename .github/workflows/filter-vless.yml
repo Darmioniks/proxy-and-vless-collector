@@ -47,7 +47,7 @@ jobs:
           python filter_vless.py \
             --input vless.txt \
             --output vless_filtered.txt \
-            --count 10
+            --count 30
 
       - name: Commit & push if changed
         run: |
