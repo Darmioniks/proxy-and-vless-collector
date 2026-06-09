@@ -65,7 +65,6 @@ def extract_vless_name(vless_url):
         if '#' in vless_url:
             fragment = vless_url.split('#', 1)[1]
             name = urllib.parse.unquote(fragment)
-            # Убираем числовой префикс типа "1. 🇵🇱 VLESS | ..."
             name = name.strip()
             return name if name else "VLESS Ключ"
         return "VLESS Ключ"
@@ -76,13 +75,11 @@ def extract_vless_name(vless_url):
 def extract_vless_host(vless_url):
     """Извлекает хост:порт из VLESS URL для отображения"""
     try:
-        # vless://uuid@host:port?params#name
         without_scheme = vless_url[len("vless://"):]
         at_idx = without_scheme.find('@')
         if at_idx == -1:
             return ""
         host_part = without_scheme[at_idx + 1:]
-        # Убираем параметры
         if '?' in host_part:
             host_part = host_part.split('?')[0]
         elif '#' in host_part:
@@ -90,6 +87,33 @@ def extract_vless_host(vless_url):
         return host_part
     except Exception:
         return ""
+
+
+def extract_vless_server_port(vless_url):
+    """Извлекает (host, port) из vless://uuid@host:port?... для TCP-проверки"""
+    try:
+        without_scheme = vless_url[len("vless://"):]
+        at_idx = without_scheme.find('@')
+        if at_idx == -1:
+            return None, None
+        host_part = without_scheme[at_idx + 1:]
+        if '?' in host_part:
+            host_part = host_part.split('?')[0]
+        elif '#' in host_part:
+            host_part = host_part.split('#')[0]
+        # Поддержка IPv6: [::1]:443
+        if host_part.startswith('['):
+            bracket_end = host_part.find(']')
+            host = host_part[1:bracket_end]
+            port = host_part[bracket_end + 2:]
+        elif ':' in host_part:
+            parts = host_part.rsplit(':', 1)
+            host, port = parts[0], parts[1]
+        else:
+            return None, None
+        return host, int(port)
+    except Exception:
+        return None, None
 
 
 st.title("🔐 Proxy Manager")
@@ -173,10 +197,138 @@ with tab_mtproto:
 # ─── Вкладка VLESS ──────────────────────────────────────────────────────────
 with tab_vless:
     st.subheader("VLESS Keys")
-    st.write("Ключи собраны из нескольких репозиториев. Проверку пинга выполните самостоятельно в вашем клиенте (v2rayN, Hiddify, Streisand и др.).")
+    st.write("Ключи собраны из нескольких репозиториев.")
 
+    # ── Умный подбор рабочих ключей ──────────────────────────────────────────
+    st.markdown("### 🎯 Умный подбор рабочих ключей")
+    st.write(
+        "Программа проверит TCP-доступность каждого сервера и соберёт ровно столько **живых** ключей, "
+        "сколько вы укажете."
+    )
+
+    col_input, col_btn = st.columns([2, 3])
+    with col_input:
+        wanted = st.number_input(
+            "Нужно рабочих ключей:",
+            min_value=1, max_value=500, value=50, step=10,
+            key="vless_wanted"
+        )
+    with col_btn:
+        st.write("")
+        st.write("")
+        run_smart = st.button(
+            f"🚀 Найти {int(wanted)} рабочих ключей",
+            use_container_width=True,
+            key="btn_vless_smart"
+        )
+
+    if 'smart_vless_keys' not in st.session_state:
+        st.session_state.smart_vless_keys = []
+    if 'smart_vless_done' not in st.session_state:
+        st.session_state.smart_vless_done = False
+
+    if run_smart:
+        target = int(wanted)
+        found_keys = []
+        progress_bar = st.progress(0, text="Загружаем базу ключей...")
+        status_text = st.empty()
+
+        # Шаг 1: скачиваем все ключи из всех источников
+        all_raw_keys = []
+        seen = set()
+        for src_url in VLESS_SOURCES:
+            try:
+                r = requests.get(src_url, timeout=10)
+                if r.status_code == 200:
+                    for line in r.text.splitlines():
+                        line = line.strip()
+                        if line.startswith("vless://") and line not in seen:
+                            seen.add(line)
+                            all_raw_keys.append(line)
+            except Exception:
+                continue
+
+        # Перемешиваем — чтобы не брать только из первого источника
+        random.shuffle(all_raw_keys)
+        total_to_check = len(all_raw_keys)
+        status_text.info(f"📦 Загружено {total_to_check} уникальных ключей. Проверяем TCP-доступность...")
+
+        # Шаг 2: TCP-проверка, останавливаемся когда набрали нужное кол-во
+        checked = 0
+        for key in all_raw_keys:
+            if len(found_keys) >= target:
+                break
+            host, port = extract_vless_server_port(key)
+            ping = check_tcp_ping(host, port, timeout=1.5)
+            checked += 1
+            if ping is not None:
+                found_keys.append({"key": key, "ping": ping})
+            if checked % 10 == 0 or len(found_keys) >= target:
+                pct = min(len(found_keys) / target, 1.0)
+                progress_bar.progress(
+                    pct,
+                    text=f"✅ Найдено {len(found_keys)} / {target} | Проверено {checked} / {total_to_check}"
+                )
+
+        found_keys.sort(key=lambda x: x['ping'])
+        st.session_state.smart_vless_keys = found_keys
+        st.session_state.smart_vless_done = True
+        progress_bar.empty()
+
+        if len(found_keys) == 0:
+            status_text.error("❌ Не найдено ни одного рабочего ключа. Попробуйте позже.")
+        elif len(found_keys) < target:
+            status_text.warning(
+                f"⚠️ База закончилась раньше: найдено {len(found_keys)} из {target} запрошенных рабочих ключей."
+            )
+        else:
+            status_text.success(f"🎉 Готово! Найдено {len(found_keys)} рабочих ключей.")
+
+    if st.session_state.smart_vless_done and st.session_state.smart_vless_keys:
+        smart_keys = st.session_state.smart_vless_keys
+        st.markdown(f"**Рабочих ключей:** {len(smart_keys)} | Сортировка: по пингу ⬆️")
+
+        sh1, sh2, sh3 = st.columns([1, 4, 2])
+        sh1.markdown("**#**")
+        sh2.markdown("**Хост / Имя**")
+        sh3.markdown("**Пинг**")
+        st.markdown("<div style='border-top: 1px solid #ccc; margin-bottom: 6px;'></div>",
+                    unsafe_allow_html=True)
+
+        for si, item in enumerate(smart_keys[:100]):
+            sc1, sc2, sc3 = st.columns([1, 4, 2])
+            sc1.write(str(si + 1))
+            name = extract_vless_name(item['key'])
+            host = extract_vless_host(item['key'])
+            display = name if name != "VLESS Ключ" else host
+            sc2.markdown(
+                f"<span title='{item['key']}' style='font-size:12px; word-break:break-all;'>{display}</span>",
+                unsafe_allow_html=True
+            )
+            sc3.markdown(
+                f"<span style='color:#2a9d8f; font-weight:bold;'>{item['ping']} мс</span>",
+                unsafe_allow_html=True
+            )
+            st.markdown("<div style='border-top: 1px solid rgba(0,0,0,0.05); margin: 2px 0;'></div>",
+                        unsafe_allow_html=True)
+
+        if len(smart_keys) > 100:
+            st.info(f"Показаны первые 100 из {len(smart_keys)}. Все ключи доступны в файле ниже.")
+
+        smart_bytes = "\n".join(item['key'] for item in smart_keys).encode("utf-8")
+        st.download_button(
+            label=f"⬇️ Скачать {len(smart_keys)} рабочих ключей (vless_working.txt)",
+            data=smart_bytes,
+            file_name="vless_working.txt",
+            mime="text/plain; charset=utf-8",
+            use_container_width=True,
+            key="btn_download_smart_vless"
+        )
+
+    st.markdown("---")
+    st.markdown("### 📋 Все ключи без проверки")
     st.info(
-        "💡 **Как использовать:** Скопируйте нужный ключ и импортируйте его в ваш VPN-клиент (v2rayN, Hiddify, Nekoray, Streisand и т.д.).",
+        "💡 **Как использовать:** Скопируйте нужный ключ и импортируйте в v2rayN, Hiddify, Nekoray, Streisand и т.д.",
         icon=None
     )
 
