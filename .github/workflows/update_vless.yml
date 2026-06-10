@@ -4,7 +4,7 @@ on:
   schedule:
     # Runs every 15 minutes
     - cron: '*/15 * * * *'
-  workflow_dispatch:  # Allow manual trigger
+  workflow_dispatch: # Allow manual trigger
 
 jobs:
   update-vless:
@@ -36,6 +36,13 @@ jobs:
               "https://gitverse.ru/api/repos/bywarm/rser/raw/branch/master/selected.txt",
               "https://nowmeow.pw/8ybBd3fdCAQ6Ew5H0d66Y1hMbh63GpKUtEXQClIu/whitelist",
               "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-checked.txt",
+              "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-SNI-RU-all.txt",
+              "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-all.txt",
+              "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
+              "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt",
+              "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS_mobile.txt",
+              "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt",
+              "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_SS%2BAll_RUS.txt",
               "https://raw.githubusercontent.com/AvenCores/goida-vpn-configs/refs/heads/main/githubmirror/26.txt",
               "https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt",
               "https://wlrus.lol/confs/merged.txt",
@@ -60,9 +67,9 @@ jobs:
                           unique_vless.add(line)
                           found += 1
                   stats[source_name] = found
-                  print(f"✅ {source_name}: found {found} vless keys")
+                  print(f"\u2705 {source_name}: found {found} vless keys")
               except Exception as e:
-                  print(f"❌ {source_name}: {e}")
+                  print(f"\u274c {source_name}: {e}")
                   stats[source_name] = 0
 
           total = len(unique_vless)
