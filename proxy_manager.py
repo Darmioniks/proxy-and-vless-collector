@@ -395,11 +395,322 @@ def divider(alpha="0.05"):
     )
 
 
+def inject_theme():
+    """Тёмная glass-тема в стиле лаунчера: без градиентов, с тёплым accent."""
+    st.markdown(
+        """
+        <style>
+        :root {
+            --bg: #0a0a0f;
+            --bg-soft: #0d0d12;
+            --card: #14141a;
+            --card-hover: #1a1a22;
+            --card-border: #1e1e28;
+            --glass: #17171d;
+            --glass-border: #2d2c35;
+            --accent: #e8a87c;
+            --accent-hover: #d4956a;
+            --accent-dim: #2a1f18;
+            --text: #e8e8ed;
+            --text-secondary: #9a94a6;
+            --text-muted: #5f5a68;
+            --success: #4ade80;
+            --warning: #fbbf24;
+            --danger: #f87171;
+        }
+
+        html, body, [data-testid="stAppViewContainer"] {
+            background: var(--bg) !important;
+            color: var(--text) !important;
+        }
+        [data-testid="stAppViewContainer"]::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            background:
+                rgba(232,168,124,.018);
+            box-shadow:
+                inset 0 0 180px rgba(0,0,0,.58),
+                inset 0 0 0 1px rgba(255,255,255,.018);
+        }
+        [data-testid="stHeader"] { background: transparent !important; }
+        [data-testid="stToolbar"] { color: var(--text-secondary); }
+        .block-container {
+            padding-top: 2rem;
+            padding-bottom: 3rem;
+            max-width: 980px;
+        }
+
+        .pm-shell {
+            background: rgba(20,20,26,.92);
+            border: 1px solid rgba(255,255,255,.09);
+            border-radius: 24px;
+            padding: 28px 30px;
+            margin-bottom: 22px;
+            box-shadow: 0 18px 48px rgba(0,0,0,.48);
+            position: relative;
+            overflow: hidden;
+        }
+        .pm-shell::after {
+            content:"";
+            position:absolute;
+            right:-72px;
+            top:-72px;
+            width:190px;
+            height:190px;
+            border-radius:50%;
+            background: rgba(232,168,124,.075);
+            border: 1px solid rgba(232,168,124,.12);
+        }
+        .pm-badge {
+            display:inline-flex;
+            align-items:center;
+            gap:8px;
+            background: var(--accent-dim);
+            color: var(--accent);
+            border: 1px solid rgba(232,168,124,.32);
+            border-radius: 10px;
+            padding: 9px 13px;
+            font-size: 11px;
+            font-weight: 800;
+            letter-spacing: .08em;
+            text-transform: uppercase;
+        }
+        .pm-hero h1 {
+            margin: 16px 0 6px;
+            color: var(--text);
+            font-size: 42px;
+            line-height: 1.04;
+            font-weight: 850;
+            letter-spacing: -1.1px;
+        }
+        .pm-hero p {
+            max-width: 690px;
+            margin: 0;
+            color: var(--text-secondary);
+            font-size: 15px;
+            line-height: 1.55;
+        }
+        .pm-hero-meta {
+            display:flex;
+            flex-wrap:wrap;
+            gap:10px;
+            margin-top:18px;
+        }
+        .pm-mini-card {
+            background: rgba(255,255,255,.025);
+            border: 1px solid rgba(255,255,255,.07);
+            border-radius: 14px;
+            padding: 10px 13px;
+            color: var(--text-secondary);
+            font-size: 12px;
+        }
+        .pm-mini-card b { color: var(--text); font-weight: 750; }
+
+        h1, h2, h3, h4, h5, h6, p, label, span, div {
+            color: inherit;
+        }
+        .stMarkdown, .stText, [data-testid="stMarkdownContainer"] {
+            color: var(--text) !important;
+        }
+        [data-testid="stCaptionContainer"] {
+            color: var(--text-muted) !important;
+        }
+        .stAlert {
+            background: rgba(255,255,255,.035) !important;
+            border: 1px solid rgba(255,255,255,.08) !important;
+            border-radius: 14px !important;
+            color: var(--text-secondary) !important;
+        }
+
+        .stButton > button, .stDownloadButton > button {
+            min-height: 44px;
+            border-radius: 14px !important;
+            border: 1px solid rgba(232,168,124,.42) !important;
+            background: var(--accent) !important;
+            color: #17110d !important;
+            font-weight: 800 !important;
+            letter-spacing: .01em;
+            box-shadow: 0 12px 28px rgba(0,0,0,.28);
+            transition: transform .12s ease, background-color .15s ease, border-color .15s ease, box-shadow .15s ease;
+        }
+        .stButton > button:hover, .stDownloadButton > button:hover {
+            background: var(--accent-hover) !important;
+            border-color: rgba(232,168,124,.68) !important;
+            transform: translateY(-1px);
+            box-shadow: 0 16px 34px rgba(0,0,0,.35);
+        }
+        .stButton > button:disabled {
+            background: rgba(255,255,255,.08) !important;
+            color: var(--text-muted) !important;
+            border-color: rgba(255,255,255,.08) !important;
+            box-shadow: none;
+            transform: none;
+        }
+
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 10px;
+            background: rgba(13,13,18,.72);
+            border: 1px solid rgba(255,255,255,.07);
+            border-radius: 16px;
+            padding: 6px;
+            box-shadow: 0 12px 32px rgba(0,0,0,.22);
+        }
+        .stTabs [data-baseweb="tab"] {
+            border-radius: 12px;
+            padding: 10px 18px;
+            color: var(--text-secondary);
+            font-weight: 750;
+        }
+        .stTabs [aria-selected="true"] {
+            background: var(--accent-dim) !important;
+            color: var(--accent) !important;
+            border: 1px solid rgba(232,168,124,.25);
+        }
+
+        div[data-baseweb="input"] > div,
+        .stNumberInput input,
+        .stTextInput input,
+        textarea {
+            background: var(--glass) !important;
+            color: var(--text) !important;
+            border: 1px solid var(--glass-border) !important;
+            border-radius: 14px !important;
+        }
+        .stTextInput input:focus, .stNumberInput input:focus, textarea:focus {
+            border-color: var(--accent) !important;
+            box-shadow: 0 0 0 1px rgba(232,168,124,.28) !important;
+        }
+
+        [data-testid="stProgress"] > div { background: rgba(255,255,255,.06) !important; }
+        [data-testid="stProgress"] > div > div > div > div {
+            background: var(--accent) !important;
+        }
+
+        .pm-row {
+            display:flex;
+            align-items:center;
+            gap:12px;
+            padding:12px 14px;
+            margin:8px 0;
+            border-radius:16px;
+            background: var(--card);
+            border:1px solid var(--card-border);
+            box-shadow: 0 10px 26px rgba(0,0,0,.20);
+            transition: background-color .14s ease, border-color .14s ease, transform .12s ease;
+        }
+        .pm-row:hover {
+            background: var(--card-hover);
+            border-color: rgba(232,168,124,.28);
+            transform: translateY(-1px);
+        }
+        .pm-idx {
+            display:inline-flex;
+            align-items:center;
+            justify-content:center;
+            min-width:32px;
+            height:32px;
+            border-radius:10px;
+            background: rgba(255,255,255,.035);
+            border: 1px solid rgba(255,255,255,.06);
+            color: var(--text-muted);
+            font-weight:800;
+            font-size:12px;
+        }
+        .pm-name {
+            flex:1;
+            color: var(--text-secondary);
+            font-size:13px;
+            line-height:1.35;
+            word-break:break-all;
+        }
+        .ping-badge {
+            font-weight:800;
+            font-size:12px;
+            padding:5px 11px;
+            border-radius:999px;
+            background: rgba(74,222,128,.11);
+            border: 1px solid rgba(74,222,128,.24);
+            color: var(--success);
+            white-space:nowrap;
+        }
+        .ping-badge.slow {
+            background: rgba(251,191,36,.10);
+            border-color: rgba(251,191,36,.24);
+            color: var(--warning);
+        }
+        .tg-btn {
+            display:inline-flex;
+            align-items:center;
+            justify-content:center;
+            background: var(--accent-dim);
+            color: var(--accent) !important;
+            border: 1px solid rgba(232,168,124,.38);
+            padding:8px 14px;
+            border-radius:12px;
+            text-decoration:none;
+            font-size:12px;
+            font-weight:800;
+            white-space:nowrap;
+            transition: background-color .15s ease, border-color .15s ease;
+        }
+        .tg-btn:hover {
+            background: rgba(232,168,124,.16);
+            border-color: rgba(232,168,124,.60);
+        }
+        .pm-stat {
+            display:inline-flex;
+            align-items:center;
+            gap:6px;
+            padding:8px 13px;
+            margin:4px 7px 10px 0;
+            border-radius:12px;
+            background: rgba(232,168,124,.08);
+            border:1px solid rgba(232,168,124,.22);
+            color: var(--text-secondary);
+            font-size:12px;
+            font-weight:650;
+        }
+        .pm-stat b { color: var(--accent); }
+        code, pre {
+            background: #101016 !important;
+            border: 1px solid rgba(255,255,255,.07) !important;
+            border-radius: 12px !important;
+            color: var(--text-secondary) !important;
+        }
+        hr { border-color: rgba(255,255,255,.07) !important; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def ping_badge(ms):
+    """HTML-бейдж пинга: зелёный для быстрых, янтарный для медленных."""
+    cls = "ping-badge" if (ms or 0) < 300 else "ping-badge slow"
+    return f"<span class='{cls}'>{ms} мс</span>"
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  UI
 # ══════════════════════════════════════════════════════════════════════════
-st.title("\U0001F510 Proxy Manager")
-st.write("MTProto для Telegram и VLESS ключи из нескольких независимых источников.")
+inject_theme()
+st.markdown(
+    """
+    <section class='pm-shell pm-hero'>
+        <div class='pm-badge'>PROXY MANAGER // DARK UI</div>
+        <h1>Proxy Manager</h1>
+        <p>Сбор MTProto и VLESS из независимых источников. Быстрая дедупликация, TCP/TLS-фильтр и финальная Xray-проверка для рабочих ключей.</p>
+        <div class='pm-hero-meta'>
+            <div class='pm-mini-card'><b>TCP</b> быстрый отсев</div>
+            <div class='pm-mini-card'><b>TLS</b> handshake</div>
+            <div class='pm-mini-card'><b>Xray</b> url-test</div>
+        </div>
+    </section>
+    """,
+    unsafe_allow_html=True,
+)
 
 if not XRAY_BIN:
     st.caption(
@@ -407,7 +718,7 @@ if not XRAY_BIN:
         "Для url-теста положите бинарь `xray` рядом с приложением или в PATH."
     )
 
-tab_mtproto, tab_vless = st.tabs(["\U0001F4E1 MTProto Proxies", "\U0001F511 VLESS Keys"])
+tab_mtproto, tab_vless = st.tabs(["MTProto Proxies", "VLESS Keys"])
 
 # ─── Вкладка MTProto ──────────────────────────────────────────────────────
 with tab_mtproto:
@@ -452,28 +763,24 @@ with tab_mtproto:
     st.markdown("---")
     proxies = st.session_state.working_proxies
     if proxies:
-        st.write(f"Найдено уникальных доступных прокси (TCP): {len(proxies)}")
-        h1, h2, h3 = st.columns([1, 2, 5])
-        h1.markdown("**Номер**")
-        h2.markdown("**Пинг**")
-        h3.markdown("**Действие**")
-        divider("0.2")
+        st.markdown(
+            f"<div class='pm-stat'>Доступных прокси (TCP): <b>{len(proxies)}</b></div>",
+            unsafe_allow_html=True,
+        )
         for idx, data in enumerate(proxies):
             tg_link = data["url"].replace("https://t.me/", "tg://")
             safe_link = html.escape(tg_link, quote=True)
-            c1, c2, c3 = st.columns([1, 2, 5])
-            c1.write(str(idx + 1))
-            c2.markdown(
-                f"<span style='color:#2a9d8f;font-weight:bold;'>{data['ping']} мс</span>",
+            server, port = extract_server_port(data["url"])
+            name = html.escape(f"{server}:{port}" if server else "MTProto прокси")
+            st.markdown(
+                f"<div class='pm-row'>"
+                f"<span class='pm-idx'>{idx + 1}</span>"
+                f"{ping_badge(data['ping'])}"
+                f"<span class='pm-name'>{name}</span>"
+                f"<a class='tg-btn' href=\"{safe_link}\">Подключить</a>"
+                f"</div>",
                 unsafe_allow_html=True,
             )
-            c3.markdown(
-                f"<a href=\"{safe_link}\" style='display:inline-block;background:#3390ec;"
-                f"color:white;padding:5px 10px;border-radius:6px;text-decoration:none;"
-                f"font-size:14px;font-weight:bold;'>Подключить в Telegram</a>",
-                unsafe_allow_html=True,
-            )
-            divider()
     else:
         st.info("Таблица пуста. Нажмите кнопку выше, чтобы запустить сканирование.")
 
@@ -482,7 +789,7 @@ with tab_vless:
     st.subheader("VLESS Keys")
     st.write("Ключи собраны из нескольких репозиториев.")
 
-    st.markdown("### \U0001F3AF Умный подбор (каскад TCP → TLS → Xray)")
+    st.markdown("### Умный подбор (каскад TCP -> TLS -> Xray)")
     st.caption(
         "База сначала фильтруется быстрыми проверками, и только выжившие ключи "
         "проверяются через Xray — это многократно ускоряет обработку больших списков."
@@ -511,7 +818,7 @@ with tab_vless:
         st.write("")
         st.write("")
         run_smart = st.button(
-            f"\U0001F680 Найти {int(wanted)} рабочих ключей",
+            f"Найти {int(wanted)} рабочих ключей",
             use_container_width=True, key="btn_vless_smart",
         )
 
@@ -529,12 +836,12 @@ with tab_vless:
         total = len(all_infos)
 
         if total == 0:
-            status_text.error("\u274C Не удалось загрузить ключи.")
+            status_text.error("Не удалось загрузить ключи.")
         else:
             # ЭТАП 1: TCP по уникальным endpoint'ам
             endpoints = sorted({(i["host"], i["port"]) for i in all_infos})
             st.write(
-                f"\U0001F4E6 Загружено **{total}** ключей "
+                f"Загружено **{total}** ключей "
                 f"(**{len(endpoints)}** уникальных серверов)."
             )
             tcp_ok = run_stage(
@@ -543,7 +850,7 @@ with tab_vless:
                 MAX_TCP_WORKERS, report_every=25,
             )
             after_tcp = [i for i in all_infos if (i["host"], i["port"]) in tcp_ok]
-            st.write(f"\u2705 После TCP: **{len(after_tcp)}** ключей на **{len(tcp_ok)}** серверах.")
+            st.write(f"После TCP: **{len(after_tcp)}** ключей на **{len(tcp_ok)}** серверах.")
 
             # ЭТАП 2: TLS handshake (только tls/reality), по уникальным (host,port,sni)
             need_tls = [i for i in after_tcp if vless_security(i) in ("tls", "reality")]
@@ -558,7 +865,7 @@ with tab_vless:
                 i for i in need_tls if (i["host"], i["port"], vless_sni(i)) in tls_ok
             ]
             st.write(
-                f"\u2705 После TLS: **{len(after_tls)}** ключей "
+                f"После TLS: **{len(after_tls)}** ключей "
                 f"(без TLS пропущено напрямую: {len(passthrough)})."
             )
             random.shuffle(after_tls)
@@ -605,55 +912,52 @@ with tab_vless:
             st.session_state.smart_vless_label = check_label
 
             if not found_keys:
-                status_text.error("\u274C Не найдено ни одного рабочего ключа.")
+                status_text.error("Не найдено ни одного рабочего ключа.")
             elif len(found_keys) < target:
-                status_text.warning(f"\u26A0\uFE0F Найдено {len(found_keys)} из {target} запрошенных.")
+                status_text.warning(f"Найдено {len(found_keys)} из {target} запрошенных.")
             else:
-                status_text.success(f"\U0001F389 Готово! Найдено {len(found_keys)} ключей.")
+                status_text.success(f"Готово! Найдено {len(found_keys)} ключей.")
 
     if st.session_state.smart_vless_done and st.session_state.smart_vless_keys:
         smart_keys = st.session_state.smart_vless_keys
         label = st.session_state.get("smart_vless_label", "")
-        st.markdown(f"**Ключей:** {len(smart_keys)} | Проверка: {label} | сортировка по пингу ⬆️")
-        s1, s2, s3 = st.columns([1, 4, 2])
-        s1.markdown("**#**")
-        s2.markdown("**Хост / Имя**")
-        s3.markdown("**Пинг**")
-        divider("0.2")
+        st.markdown(
+            f"<div class='pm-stat'>Рабочих ключей: <b>{len(smart_keys)}</b></div>"
+            f"<div class='pm-stat'>Проверка: <b>{html.escape(label)}</b></div>"
+            f"<div class='pm-stat'>сортировка по пингу</div>",
+            unsafe_allow_html=True,
+        )
         for si, item in enumerate(smart_keys[:VLESS_TABLE_LIMIT]):
             info = item["info"]
             display = html.escape(vless_display_name(info))
             title = html.escape(item["key"], quote=True)
-            c1, c2, c3 = st.columns([1, 4, 2])
-            c1.write(str(si + 1))
-            c2.markdown(
-                f"<span title=\"{title}\" style='font-size:12px;word-break:break-all;'>{display}</span>",
+            st.markdown(
+                f"<div class='pm-row' title=\"{title}\">"
+                f"<span class='pm-idx'>{si + 1}</span>"
+                f"{ping_badge(item['ping'])}"
+                f"<span class='pm-name'>{display}</span>"
+                f"</div>",
                 unsafe_allow_html=True,
             )
-            c3.markdown(
-                f"<span style='color:#2a9d8f;font-weight:bold;'>{item['ping']} мс</span>",
-                unsafe_allow_html=True,
-            )
-            divider()
         if len(smart_keys) > VLESS_TABLE_LIMIT:
             st.info(f"Показаны первые {VLESS_TABLE_LIMIT} из {len(smart_keys)}.")
 
         smart_bytes = "\n".join(item["key"] for item in smart_keys).encode("utf-8")
         st.download_button(
-            label=f"\u2B07\uFE0F Скачать {len(smart_keys)} ключей (vless_working.txt)",
+            label=f"Скачать {len(smart_keys)} ключей (vless_working.txt)",
             data=smart_bytes, file_name="vless_working.txt",
             mime="text/plain; charset=utf-8", use_container_width=True,
             key="btn_download_smart_vless",
         )
 
     st.markdown("---")
-    st.markdown("### \U0001F4CB Все ключи без проверки")
-    st.info("\U0001F4A1 Скопируйте ключ и импортируйте в v2rayN, Hiddify, Nekoray, Streisand и т.д.")
+    st.markdown("### Все ключи без проверки")
+    st.info("Скопируйте ключ и импортируйте в v2rayN, Hiddify, Nekoray, Streisand и т.д.")
 
     st.session_state.setdefault("vless_keys", [])
     st.session_state.setdefault("vless_loaded", False)
 
-    if st.button("\U0001F504 Загрузить / Обновить VLESS ключи", use_container_width=True, key="btn_vless"):
+    if st.button("Загрузить / Обновить VLESS ключи", use_container_width=True, key="btn_vless"):
         with st.spinner("Загружаем ключи из источников..."):
             unique_vless = set()
             stats = {}
@@ -669,7 +973,7 @@ with tab_vless:
             st.session_state.vless_keys = sorted(unique_vless)
             st.session_state.vless_loaded = True
             st.success(
-                "\u2705 Загружено: "
+                "Загружено: "
                 + " | ".join(f"**{k}**: {v}" for k, v in stats.items())
             )
 
@@ -679,18 +983,14 @@ with tab_vless:
         st.write(f"Найдено уникальных VLESS ключей: **{len(keys)}**")
 
         search = st.text_input(
-            "\U0001F50D Фильтр по тексту (SNI, хост, имя...)",
+            "Фильтр по тексту (SNI, хост, имя...)",
             key="vless_search", placeholder="например: yandex.ru",
         )
         if search:
             keys = [k for k in keys if search.lower() in k.lower()]
             st.write(f"Показано после фильтра: **{len(keys)}**")
 
-        h1, h2, h3 = st.columns([1, 4, 2])
-        h1.markdown("**#**")
-        h2.markdown("**Имя / Хост**")
-        h3.markdown("**Копировать**")
-        divider("0.2")
+        st.caption("Имя / хост слева, справа — ключ с кнопкой копирования")
 
         total_pages = max(1, (len(keys) + PAGE_SIZE - 1) // PAGE_SIZE)
         st.session_state.setdefault("vless_page", 0)
@@ -734,7 +1034,7 @@ with tab_vless:
         st.markdown("---")
         all_keys_bytes = "\n".join(st.session_state.vless_keys).encode("utf-8")
         st.download_button(
-            label="\u2B07\uFE0F Скачать все ключи (vless_keys.txt)",
+            label="Скачать все ключи (vless_keys.txt)",
             data=all_keys_bytes, file_name="vless_keys.txt",
             mime="text/plain; charset=utf-8", use_container_width=True,
             key="btn_download_vless",
