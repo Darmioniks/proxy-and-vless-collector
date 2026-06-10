@@ -1,2 +1,2 @@
-streamlit
-requests
+streamlit>=1.30
+requests[socks]>=2.31
