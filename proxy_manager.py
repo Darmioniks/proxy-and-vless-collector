@@ -365,6 +365,20 @@ def load_vless_infos():
     return infos
 
 
+def parse_vless_text(text):
+    """Парсит сырой текст: оставляет vless://, дедупит, возвращает list[info]."""
+    seen = set()
+    infos = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("vless://") and line not in seen:
+            seen.add(line)
+            info = parse_vless(line)
+            if info:
+                infos.append(info)
+    return infos
+
+
 def run_stage(label, items, worker_fn, max_workers, report_every=20):
     """Общий раннер этапа с прогресс-баром.
     items — list ключей; worker_fn(key) -> ping|None.
@@ -795,6 +809,26 @@ with tab_vless:
         "проверяются через Xray — это многократно ускоряет обработку больших списков."
     )
 
+    own_keys = st.checkbox(
+        "Проверить свои ключи (из .txt файла)",
+        key="vless_own_enable",
+    )
+
+    own_path = ""
+    own_uploaded = None
+    if own_keys:
+        own_path = st.text_input(
+            "Путь к .txt с VLESS ключами",
+            placeholder="C:\\keys\\my_vless.txt", key="vless_own_path",
+        )
+        own_uploaded = st.file_uploader(
+            "...или загрузите .txt файл", type=["txt"], key="vless_own_file",
+        )
+        st.caption(
+            "Приоритет у загруженного файла. Проверяются ВСЕ ключи из файла "
+            "(без ограничения по количеству)."
+        )
+
     enable_xray = False
     test_url = DEFAULT_TEST_URL
     if XRAY_BIN:
@@ -808,35 +842,69 @@ with tab_vless:
                 value=DEFAULT_TEST_URL, key="vless_test_url",
             )
 
-    col_input, col_btn = st.columns([2, 3])
-    with col_input:
-        wanted = st.number_input(
-            "Нужно рабочих ключей:", min_value=1, max_value=500, value=50, step=10,
-            key="vless_wanted",
-        )
-    with col_btn:
-        st.write("")
-        st.write("")
+    if own_keys:
+        wanted = 0
         run_smart = st.button(
-            f"Найти {int(wanted)} рабочих ключей",
+            "Проверить мои ключи",
             use_container_width=True, key="btn_vless_smart",
         )
+    else:
+        col_input, col_btn = st.columns([2, 3])
+        with col_input:
+            wanted = st.number_input(
+                "Нужно рабочих ключей:", min_value=1, max_value=500, value=50, step=10,
+                key="vless_wanted",
+            )
+        with col_btn:
+            st.write("")
+            st.write("")
+            run_smart = st.button(
+                f"Найти {int(wanted)} рабочих ключей",
+                use_container_width=True, key="btn_vless_smart",
+            )
 
     st.session_state.setdefault("smart_vless_keys", [])
     st.session_state.setdefault("smart_vless_done", False)
     st.session_state.setdefault("smart_vless_label", "")
 
     if run_smart:
-        target = int(wanted)
         status_text = st.empty()
 
-        # Загрузка + парсинг + дедуп
-        with st.spinner("Загружаем и парсим базу ключей..."):
-            all_infos = load_vless_infos()
-        total = len(all_infos)
+        # Источник ключей: свой .txt файл или встроенные источники
+        all_infos = []
+        input_error = False
+        if own_keys:
+            try:
+                if own_uploaded is not None:
+                    raw_text = own_uploaded.getvalue().decode("utf-8", "ignore")
+                    all_infos = parse_vless_text(raw_text)
+                elif own_path.strip():
+                    with open(own_path.strip(), encoding="utf-8", errors="ignore") as fh:
+                        all_infos = parse_vless_text(fh.read())
+                else:
+                    input_error = True
+                    status_text.warning("Укажите путь к .txt файлу или загрузите файл.")
+            except FileNotFoundError:
+                input_error = True
+                status_text.error("Файл не найден. Проверьте путь.")
+            except OSError as err:
+                input_error = True
+                status_text.error(f"Не удалось прочитать файл: {err}")
+        else:
+            with st.spinner("Загружаем и парсим базу ключей..."):
+                all_infos = load_vless_infos()
 
-        if total == 0:
-            status_text.error("Не удалось загрузить ключи.")
+        total = len(all_infos)
+        # Свои ключи проверяем целиком, без лимита N
+        target = total if own_keys else int(wanted)
+
+        if input_error:
+            pass
+        elif total == 0:
+            status_text.error(
+                "В файле не найдено ключей vless://."
+                if own_keys else "Не удалось загрузить ключи."
+            )
         else:
             # ЭТАП 1: TCP по уникальным endpoint'ам
             endpoints = sorted({(i["host"], i["port"]) for i in all_infos})
@@ -913,6 +981,10 @@ with tab_vless:
 
             if not found_keys:
                 status_text.error("Не найдено ни одного рабочего ключа.")
+            elif own_keys:
+                status_text.success(
+                    f"Готово! Рабочих: {len(found_keys)} из {total} проверенных."
+                )
             elif len(found_keys) < target:
                 status_text.warning(f"Найдено {len(found_keys)} из {target} запрошенных.")
             else:
