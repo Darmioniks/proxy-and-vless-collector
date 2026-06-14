@@ -30,8 +30,12 @@ import os
 import json
 import shutil
 import tempfile
+import base64
 import subprocess
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import pandas as pd
 
 # ──────────────────────────────────────────────────────────────────────────
 #  Конфигурация
@@ -79,6 +83,12 @@ _here = os.path.dirname(os.path.abspath(__file__))
 XRAY_BIN = shutil.which("xray") or (
     os.path.join(_here, "xray") if os.path.exists(os.path.join(_here, "xray")) else None
 )
+
+HISTORY_FILE = os.path.join(_here, "history.json")
+HISTORY_LIMIT = 300
+WORKING_DB_FILE = os.path.join(_here, "working_vless.json")
+WORKING_DB_LIMIT = 1000
+DEFAULT_SPEED_URL = "https://speed.cloudflare.com/__down?bytes=1000000"
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -328,6 +338,70 @@ def url_test_vless(info, test_url=DEFAULT_TEST_URL, timeout=8):
                 pass
 
 
+def speed_test_vless(info, speed_url=DEFAULT_SPEED_URL, timeout=12):
+    """Мини speed-test через xray. Возвращает Mbps или None."""
+    if not XRAY_BIN:
+        return None
+    try:
+        outbound = vless_to_outbound(info)
+    except Exception:
+        return None
+
+    socks_port = free_port()
+    config = {
+        "log": {"loglevel": "none"},
+        "inbounds": [{
+            "listen": "127.0.0.1",
+            "port": socks_port,
+            "protocol": "socks",
+            "settings": {"udp": False},
+        }],
+        "outbounds": [outbound],
+    }
+    cfg_path = None
+    proc = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(config, f)
+            cfg_path = f.name
+        proc = subprocess.Popen(
+            [XRAY_BIN, "run", "-c", cfg_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(0.8)
+        proxies = {
+            "http": f"socks5h://127.0.0.1:{socks_port}",
+            "https": f"socks5h://127.0.0.1:{socks_port}",
+        }
+        start = time.time()
+        r = requests.get(speed_url, proxies=proxies, timeout=timeout, headers=HTTP_HEADERS, stream=True)
+        if r.status_code not in (200, 204):
+            return None
+        size = 0
+        for chunk in r.iter_content(chunk_size=65536):
+            if chunk:
+                size += len(chunk)
+        elapsed = max(time.time() - start, 0.001)
+        if size <= 0:
+            return None
+        return round((size * 8) / elapsed / 1_000_000, 2)
+    except Exception:
+        return None
+    finally:
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
+        if cfg_path and os.path.exists(cfg_path):
+            try:
+                os.unlink(cfg_path)
+            except Exception:
+                pass
+
+
 # ──────────────────────────────────────────────────────────────────────────
 #  Загрузка источников
 # ──────────────────────────────────────────────────────────────────────────
@@ -379,6 +453,188 @@ def parse_vless_text(text):
     return infos
 
 
+def make_subscription(keys):
+    """base64-подписка из списка vless-ключей (импорт одной ссылкой)."""
+    blob = "\n".join(keys).strip()
+    return base64.b64encode(blob.encode("utf-8")).decode("ascii")
+
+
+def load_history():
+    """Читает историю замеров из history.json. Возвращает list[record]."""
+    try:
+        with open(HISTORY_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def append_history(counts):
+    """Добавляет запись {ts, counts} в историю и обрезает до HISTORY_LIMIT."""
+    hist = load_history()
+    hist.append({
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "counts": {k: int(v) for k, v in counts.items()},
+    })
+    hist = hist[-HISTORY_LIMIT:]
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as fh:
+            json.dump(hist, fh, ensure_ascii=False)
+    except Exception:
+        pass
+    return hist
+
+
+def render_bar_chart(items):
+    """items: list[(label, value)] -> красивые пастельные столбики (HTML/CSS)."""
+    items = [(lbl, float(val)) for lbl, val in items]
+    if not items:
+        st.info("Нет данных для графика.")
+        return
+    max_val = max((v for _, v in items), default=0) or 1
+    cols = []
+    for label, value in items:
+        pct = max(4, round(value / max_val * 100))
+        lbl = html.escape(str(label))
+        val_int = int(round(value))
+        cols.append(
+            f"<div class='pm-bar-col'>"
+            f"<div class='pm-bar-val'>{val_int}</div>"
+            f"<div class='pm-bar' style='height:{pct}%' title='{lbl}: {val_int}'></div>"
+            f"<div class='pm-bar-lbl'>{lbl}</div>"
+            f"</div>"
+        )
+    st.markdown(f"<div class='pm-chart'>{''.join(cols)}</div>", unsafe_allow_html=True)
+
+
+def load_working_db():
+    """Рабочая база: последние реально найденные ключи с метриками."""
+    try:
+        with open(WORKING_DB_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_working_db(items):
+    """Сохраняет базу рабочих ключей, дедуп по raw, лучшие/свежие сверху."""
+    merged = {}
+    for item in items:
+        key = item.get("key") or item.get("raw")
+        if not key:
+            continue
+        merged[key] = item
+    out = sorted(
+        merged.values(),
+        key=lambda x: (int(x.get("score", 0)), str(x.get("last_checked", ""))),
+        reverse=True,
+    )[:WORKING_DB_LIMIT]
+    try:
+        with open(WORKING_DB_FILE, "w", encoding="utf-8") as fh:
+            json.dump(out, fh, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return out
+
+
+def upsert_working_db(found_items):
+    old = load_working_db()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    by_key = {x.get("key"): x for x in old if x.get("key")}
+    for item in found_items:
+        info = item.get("info") or parse_vless(item.get("key", ""))
+        if not info:
+            continue
+        meta = vless_meta(info)
+        rec = {
+            "key": item["key"],
+            "name": vless_display_name(info),
+            "host": info["host"],
+            "port": info["port"],
+            "security": meta["security"],
+            "network": meta["network"],
+            "sni": meta["sni"],
+            "ping": int(item.get("ping") or 0),
+            "speed": item.get("speed"),
+            "score": vless_score(info, item.get("ping"), item.get("speed")),
+            "last_checked": now,
+        }
+        by_key[item["key"]] = rec
+    return save_working_db(list(by_key.values()))
+
+
+def vless_meta(info):
+    p = info.get("params", {}) if info else {}
+    return {
+        "security": p.get("security", "none"),
+        "network": p.get("type", "tcp"),
+        "sni": p.get("sni") or p.get("host") or "",
+        "flow": p.get("flow", ""),
+        "fp": p.get("fp", ""),
+    }
+
+
+def vless_score(info, ping=None, speed=None):
+    """Простая оценка качества 0..100: ping + скорость + тип конфига."""
+    meta = vless_meta(info)
+    score = 50
+    if ping is not None:
+        if ping <= 120:
+            score += 25
+        elif ping <= 250:
+            score += 18
+        elif ping <= 500:
+            score += 10
+        else:
+            score += 3
+    if speed is not None:
+        if speed >= 30:
+            score += 20
+        elif speed >= 10:
+            score += 14
+        elif speed >= 3:
+            score += 8
+        else:
+            score += 2
+    if meta["security"] == "reality":
+        score += 5
+    if meta["sni"]:
+        score += 3
+    if meta["flow"]:
+        score += 2
+    return max(0, min(100, int(score)))
+
+
+def score_label(score):
+    if score >= 90:
+        return "Отличный"
+    if score >= 75:
+        return "Хороший"
+    if score >= 60:
+        return "Средний"
+    return "Слабый"
+
+
+def filter_vless_infos(infos, only_reality=False, only_tls=False, only_tcp=False,
+                       exclude_ws=False, require_sni=False):
+    out = []
+    for info in infos:
+        meta = vless_meta(info)
+        if only_reality and meta["security"] != "reality":
+            continue
+        if only_tls and meta["security"] != "tls":
+            continue
+        if only_tcp and meta["network"] != "tcp":
+            continue
+        if exclude_ws and meta["network"] == "ws":
+            continue
+        if require_sni and not meta["sni"]:
+            continue
+        out.append(info)
+    return out
+
+
 def run_stage(label, items, worker_fn, max_workers, report_every=20):
     """Общий раннер этапа с прогресс-баром.
     items — list ключей; worker_fn(key) -> ping|None.
@@ -409,62 +665,101 @@ def divider(alpha="0.05"):
     )
 
 
-def inject_theme():
-    """Тёмная glass-тема в стиле лаунчера: без градиентов, с тёплым accent."""
+def inject_theme(dark=False):
+    """Светлая пастельно-оранжевая тема: скользящий индикатор вкладок и плавные экспандеры."""
     st.markdown(
         """
         <style>
         :root {
-            --bg: #0a0a0f;
-            --bg-soft: #0d0d12;
-            --card: #14141a;
-            --card-hover: #1a1a22;
-            --card-border: #1e1e28;
-            --glass: #17171d;
-            --glass-border: #2d2c35;
-            --accent: #e8a87c;
-            --accent-hover: #d4956a;
-            --accent-dim: #2a1f18;
-            --text: #e8e8ed;
-            --text-secondary: #9a94a6;
-            --text-muted: #5f5a68;
-            --success: #4ade80;
-            --warning: #fbbf24;
-            --danger: #f87171;
+            --bg: #fff7f0;
+            --bg-soft: #fffdfb;
+            --card: #ffffff;
+            --card-2: #fff3e8;
+            --card-hover: #fff1e3;
+            --border: #f4ddc8;
+            --border-strong: #eccbaa;
+            --accent: #f0a868;
+            --accent-strong: #e8915f;
+            --accent-soft: #fde7d2;
+            --accent-tint: #fff1e3;
+            --text: #4a3b30;
+            --text-secondary: #8a7867;
+            --text-muted: #b5a292;
+            --success: #6cbf8b;
+            --success-soft: #e3f3ea;
+            --success-bd: #c8e6d5;
+            --warning: #e0a64b;
+            --warning-soft: #fbeed2;
+            --warning-bd: #f0dca8;
+            --danger: #e07a5f;
+            --shadow: 0 14px 36px rgba(224,150,80,.14);
+            --shadow-sm: 0 6px 16px rgba(224,150,80,.10);
+            --hero-glow: #ffe9d4;
+            --code-bg: #fffaf4;
         }
+        [data-theme="dark"] {
+            --bg: #0f0d12;
+            --bg-soft: #16131a;
+            --card: #1a161f;
+            --card-2: #211c28;
+            --card-hover: #2a252f;
+            --border: #2c2533;
+            --border-strong: #3a3142;
+            --accent: #f0a868;
+            --accent-strong: #f6bd84;
+            --accent-soft: #3a2a1d;
+            --accent-tint: #241a14;
+            --text: #f0e7df;
+            --text-secondary: #b6a695;
+            --text-muted: #7c6d60;
+            --success: #7fd6a1;
+            --success-soft: #16271d;
+            --success-bd: #244a33;
+            --warning: #f0c061;
+            --warning-soft: #2a2113;
+            --warning-bd: #473918;
+            --danger: #f87171;
+            --shadow: 0 18px 44px rgba(0,0,0,.5);
+            --shadow-sm: 0 8px 20px rgba(0,0,0,.4);
+            --hero-glow: #2a1d12;
+            --code-bg: #120f16;
+        }
+
+        @keyframes pmFadeUp { from { opacity:0; transform:translateY(16px); } to { opacity:1; transform:translateY(0); } }
+        @keyframes pmFadeIn { from { opacity:0; } to { opacity:1; } }
 
         html, body, [data-testid="stAppViewContainer"] {
             background: var(--bg) !important;
             color: var(--text) !important;
         }
-        [data-testid="stAppViewContainer"]::before {
-            content: "";
-            position: fixed;
-            inset: 0;
-            pointer-events: none;
+        [data-testid="stApp"], [data-testid="stAppViewContainer"] {
             background:
-                rgba(232,168,124,.018);
-            box-shadow:
-                inset 0 0 180px rgba(0,0,0,.58),
-                inset 0 0 0 1px rgba(255,255,255,.018);
+                radial-gradient(1200px 480px at 50% -120px, var(--hero-glow) 0%, rgba(255,233,212,0) 70%),
+                radial-gradient(540px 540px at 6% 12%, rgba(240,168,104,0.30) 0%, rgba(240,168,104,0) 68%),
+                radial-gradient(560px 560px at 97% 22%, rgba(224,138,138,0.24) 0%, rgba(224,138,138,0) 68%),
+                radial-gradient(680px 680px at 94% 95%, rgba(240,168,104,0.28) 0%, rgba(240,168,104,0) 70%),
+                radial-gradient(520px 520px at 2% 92%, rgba(108,191,139,0.20) 0%, rgba(108,191,139,0) 68%),
+                var(--bg) !important;
+            background-repeat: no-repeat, no-repeat, no-repeat, no-repeat, no-repeat !important;
         }
         [data-testid="stHeader"] { background: transparent !important; }
         [data-testid="stToolbar"] { color: var(--text-secondary); }
         .block-container {
             padding-top: 2rem;
             padding-bottom: 3rem;
-            max-width: 980px;
+            max-width: 880px;
         }
 
         .pm-shell {
-            background: rgba(20,20,26,.92);
-            border: 1px solid rgba(255,255,255,.09);
+            background: var(--card);
+            border: 1px solid var(--border);
             border-radius: 24px;
             padding: 28px 30px;
             margin-bottom: 22px;
-            box-shadow: 0 18px 48px rgba(0,0,0,.48);
+            box-shadow: var(--shadow);
             position: relative;
             overflow: hidden;
+            animation: pmFadeUp .5s ease both;
         }
         .pm-shell::after {
             content:"";
@@ -474,16 +769,16 @@ def inject_theme():
             width:190px;
             height:190px;
             border-radius:50%;
-            background: rgba(232,168,124,.075);
-            border: 1px solid rgba(232,168,124,.12);
+            background: var(--accent-tint);
+            border: 1px solid var(--accent-soft);
         }
         .pm-badge {
             display:inline-flex;
             align-items:center;
             gap:8px;
-            background: var(--accent-dim);
-            color: var(--accent);
-            border: 1px solid rgba(232,168,124,.32);
+            background: var(--accent-tint);
+            color: var(--accent-strong);
+            border: 1px solid var(--accent-soft);
             border-radius: 10px;
             padding: 9px 13px;
             font-size: 11px;
@@ -512,19 +807,39 @@ def inject_theme():
             gap:10px;
             margin-top:18px;
         }
+        /* theme toggle button */
+        #themeBtn {
+            position: fixed;
+            top: 18px;
+            right: 18px;
+            z-index: 1000;
+            width: 42px;
+            height: 42px;
+            border-radius: 999px;
+            border: 1px solid var(--border);
+            background: var(--card);
+            color: var(--accent-strong);
+            font-size: 18px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            box-shadow: var(--shadow-sm);
+            transition: transform .2s ease, background .2s ease;
+        }
+        #themeBtn:hover { transform: scale(1.05); }
         .pm-mini-card {
-            background: rgba(255,255,255,.025);
-            border: 1px solid rgba(255,255,255,.07);
+            background: var(--card-2);
+            border: 1px solid var(--border);
             border-radius: 14px;
             padding: 10px 13px;
             color: var(--text-secondary);
             font-size: 12px;
+            transition: transform .16s ease, border-color .16s ease, color .16s ease;
         }
-        .pm-mini-card b { color: var(--text); font-weight: 750; }
+        .pm-mini-card:hover { transform: translateY(-2px); border-color: var(--accent); color: var(--text); }
+        .pm-mini-card b { color: var(--accent-strong); font-weight: 800; }
 
-        h1, h2, h3, h4, h5, h6, p, label, span, div {
-            color: inherit;
-        }
         .stMarkdown, .stText, [data-testid="stMarkdownContainer"] {
             color: var(--text) !important;
         }
@@ -532,74 +847,149 @@ def inject_theme():
             color: var(--text-muted) !important;
         }
         .stAlert {
-            background: rgba(255,255,255,.035) !important;
-            border: 1px solid rgba(255,255,255,.08) !important;
+            background: var(--card-2) !important;
+            border: 1px solid var(--border) !important;
             border-radius: 14px !important;
             color: var(--text-secondary) !important;
         }
 
         .stButton > button, .stDownloadButton > button {
-            min-height: 44px;
+            min-height: 50px;
+            width: 100%;
+            padding: 0 22px !important;
             border-radius: 14px !important;
-            border: 1px solid rgba(232,168,124,.42) !important;
+            border: 1px solid var(--accent-strong) !important;
             background: var(--accent) !important;
-            color: #17110d !important;
+            color: #3b2a1c !important;
             font-weight: 800 !important;
             letter-spacing: .01em;
-            box-shadow: 0 12px 28px rgba(0,0,0,.28);
-            transition: transform .12s ease, background-color .15s ease, border-color .15s ease, box-shadow .15s ease;
+            box-shadow: var(--shadow-sm);
+            transition: transform .14s ease, background-color .16s ease, border-color .16s ease, box-shadow .16s ease;
         }
         .stButton > button:hover, .stDownloadButton > button:hover {
-            background: var(--accent-hover) !important;
-            border-color: rgba(232,168,124,.68) !important;
-            transform: translateY(-1px);
-            box-shadow: 0 16px 34px rgba(0,0,0,.35);
+            background: var(--accent-strong) !important;
+            border-color: var(--accent-strong) !important;
+            transform: translateY(-2px);
+            box-shadow: var(--shadow);
+        }
+        .stButton > button:active, .stDownloadButton > button:active { transform: translateY(0); }
+        .stButton > button[kind="primary"],
+        .stButton > button[data-testid="stBaseButton-primary"] {
+            background: #e6a0a0 !important;
+            border-color: #db8a8a !important;
+            color: #5a2b2b !important;
+        }
+        .stButton > button[kind="primary"]:hover,
+        .stButton > button[data-testid="stBaseButton-primary"]:hover {
+            background: #db8a8a !important;
+            border-color: #db8a8a !important;
+        }
+        .stDownloadButton > button[kind="primary"],
+        .stDownloadButton > button[data-testid="stBaseButton-primary"] {
+            background: var(--card-2) !important;
+            border-color: var(--border-strong) !important;
+            color: var(--text-secondary) !important;
+        }
+        .stDownloadButton > button[kind="primary"]:hover,
+        .stDownloadButton > button[data-testid="stBaseButton-primary"]:hover {
+            background: var(--card-hover) !important;
+            border-color: var(--border-strong) !important;
+            color: var(--text) !important;
         }
         .stButton > button:disabled {
-            background: rgba(255,255,255,.08) !important;
+            background: var(--card-2) !important;
             color: var(--text-muted) !important;
-            border-color: rgba(255,255,255,.08) !important;
+            border-color: var(--border) !important;
             box-shadow: none;
             transform: none;
         }
 
+        /* TABS — sliding pill indicator (BaseWeb highlight animates left/width) */
         .stTabs [data-baseweb="tab-list"] {
-            gap: 10px;
-            background: rgba(13,13,18,.72);
-            border: 1px solid rgba(255,255,255,.07);
+            display: flex;
+            width: 100%;
+            gap: 8px;
+            background: var(--card-2);
+            border: 1px solid var(--border);
             border-radius: 16px;
             padding: 6px;
-            box-shadow: 0 12px 32px rgba(0,0,0,.22);
+            position: relative;
+            box-shadow: var(--shadow-sm);
         }
         .stTabs [data-baseweb="tab"] {
-            border-radius: 12px;
+            flex: 1 1 0;
+            justify-content: center;
+            text-align: center;
+            border-radius: 11px;
             padding: 10px 18px;
             color: var(--text-secondary);
             font-weight: 750;
+            background: transparent !important;
+            position: relative;
+            z-index: 1;
+            transition: color .25s ease;
         }
-        .stTabs [aria-selected="true"] {
-            background: var(--accent-dim) !important;
-            color: var(--accent) !important;
-            border: 1px solid rgba(232,168,124,.25);
+        .stTabs [data-baseweb="tab"]:hover { color: var(--text); }
+        .stTabs [aria-selected="true"] { color: var(--accent-strong) !important; }
+        .stTabs [data-baseweb="tab-highlight"] {
+            height: auto !important;
+            top: 6px !important;
+            bottom: 6px !important;
+            border-radius: 11px !important;
+            background: var(--card) !important;
+            border: 1px solid var(--border);
+            box-shadow: var(--shadow-sm);
+            z-index: 0 !important;
         }
+        .stTabs [data-baseweb="tab-border"] { display: none !important; }
+        [data-baseweb="tab-panel"] { animation: pmFadeIn .45s ease both; }
 
         div[data-baseweb="input"] > div,
         .stNumberInput input,
         .stTextInput input,
-        textarea {
-            background: var(--glass) !important;
+        textarea,
+        .stSelectbox div[data-baseweb="select"] > div {
+            background: var(--bg-soft) !important;
             color: var(--text) !important;
-            border: 1px solid var(--glass-border) !important;
-            border-radius: 14px !important;
+            border: 1px solid var(--border) !important;
+            border-radius: 13px !important;
         }
         .stTextInput input:focus, .stNumberInput input:focus, textarea:focus {
             border-color: var(--accent) !important;
-            box-shadow: 0 0 0 1px rgba(232,168,124,.28) !important;
+            box-shadow: 0 0 0 1px var(--accent-soft) !important;
+        }
+        /* remove gray borders under inputs in light theme */
+        .stTextInput, .stNumberInput, .stTextArea, .stSelectbox {
+            border: none !important;
+            box-shadow: none !important;
+        }
+        .stTextInput > div, .stNumberInput > div, .stTextArea > div {
+            border: none !important;
+            box-shadow: none !important;
         }
 
-        [data-testid="stProgress"] > div { background: rgba(255,255,255,.06) !important; }
+        [data-testid="stProgress"] > div { background: #e8e4df !important; }
         [data-testid="stProgress"] > div > div > div > div {
             background: var(--accent) !important;
+        }
+
+        /* EXPANDERS — smooth open animation */
+        [data-testid="stExpander"] details {
+            border: 1px solid var(--border) !important;
+            border-radius: 13px !important;
+            background: var(--bg-soft) !important;
+            overflow: hidden;
+            transition: border-color .18s ease;
+        }
+        [data-testid="stExpander"] details:hover { border-color: var(--border-strong) !important; }
+        [data-testid="stExpander"] summary {
+            border-radius: 13px !important;
+            font-weight: 700;
+            color: var(--text);
+        }
+        [data-testid="stExpander"] summary:hover { color: var(--accent-strong); }
+        [data-testid="stExpander"] details[open] [data-testid="stExpanderDetails"] {
+            animation: pmFadeUp .34s cubic-bezier(.4,.05,.2,1) both;
         }
 
         .pm-row {
@@ -610,14 +1000,15 @@ def inject_theme():
             margin:8px 0;
             border-radius:16px;
             background: var(--card);
-            border:1px solid var(--card-border);
-            box-shadow: 0 10px 26px rgba(0,0,0,.20);
-            transition: background-color .14s ease, border-color .14s ease, transform .12s ease;
+            border:1px solid var(--border);
+            box-shadow: var(--shadow-sm);
+            transition: background-color .14s ease, border-color .14s ease, transform .12s ease, box-shadow .14s ease;
         }
         .pm-row:hover {
             background: var(--card-hover);
-            border-color: rgba(232,168,124,.28);
-            transform: translateY(-1px);
+            border-color: var(--accent);
+            transform: translateY(-2px);
+            box-shadow: var(--shadow);
         }
         .pm-idx {
             display:inline-flex;
@@ -626,11 +1017,66 @@ def inject_theme():
             min-width:32px;
             height:32px;
             border-radius:10px;
-            background: rgba(255,255,255,.035);
-            border: 1px solid rgba(255,255,255,.06);
-            color: var(--text-muted);
+            background: var(--accent-tint);
+            border: 1px solid var(--accent-soft);
+            color: var(--accent-strong);
             font-weight:800;
             font-size:12px;
+            transition: transform .14s ease, background-color .14s ease;
+        }
+        .pm-row:hover .pm-idx { transform: rotate(-6deg) scale(1.05); }
+        .pm-chart {
+            display:flex;
+            align-items:flex-end;
+            gap:10px;
+            height:240px;
+            padding:18px 16px 14px;
+            margin:6px 0 4px;
+            background: linear-gradient(180deg, var(--accent-tint) 0%, var(--bg-soft) 100%);
+            border: 1px solid var(--border);
+            border-radius:18px;
+            box-shadow: var(--shadow-sm);
+        }
+        .pm-bar-col {
+            flex:1;
+            min-width:0;
+            height:100%;
+            display:flex;
+            flex-direction:column;
+            align-items:center;
+            justify-content:flex-end;
+            gap:6px;
+        }
+        .pm-bar-val {
+            font-size:12px;
+            font-weight:800;
+            color: var(--accent-strong);
+            white-space:nowrap;
+        }
+        .pm-bar {
+            width:100%;
+            max-width:48px;
+            background: linear-gradient(180deg, var(--accent) 0%, var(--accent-strong) 100%);
+            border-radius:8px 8px 4px 4px;
+            opacity:.92;
+            transform-origin:bottom;
+            animation: pmGrowBar .8s cubic-bezier(.22,.9,.3,1) both;
+            box-shadow: 0 6px 14px rgba(240,168,104,.30);
+            transition: opacity .15s ease, filter .15s ease;
+        }
+        .pm-bar:hover { opacity:1; filter:brightness(1.05); }
+        .pm-bar-lbl {
+            font-size:11px;
+            color: var(--text-muted);
+            text-align:center;
+            white-space:nowrap;
+            overflow:hidden;
+            text-overflow:ellipsis;
+            max-width:100%;
+        }
+        @keyframes pmGrowBar {
+            from { transform: scaleY(0); opacity:0; }
+            to   { transform: scaleY(1); opacity:.92; }
         }
         .pm-name {
             flex:1;
@@ -644,34 +1090,35 @@ def inject_theme():
             font-size:12px;
             padding:5px 11px;
             border-radius:999px;
-            background: rgba(74,222,128,.11);
-            border: 1px solid rgba(74,222,128,.24);
-            color: var(--success);
+            background: var(--success-soft);
+            border: 1px solid var(--success-bd);
+            color: #3f8b63;
             white-space:nowrap;
         }
         .ping-badge.slow {
-            background: rgba(251,191,36,.10);
-            border-color: rgba(251,191,36,.24);
-            color: var(--warning);
+            background: var(--warning-soft);
+            border-color: var(--warning-bd);
+            color: #9a7220;
         }
         .tg-btn {
             display:inline-flex;
             align-items:center;
             justify-content:center;
-            background: var(--accent-dim);
-            color: var(--accent) !important;
-            border: 1px solid rgba(232,168,124,.38);
+            background: var(--accent-tint);
+            color: var(--accent-strong) !important;
+            border: 1px solid var(--accent-soft);
             padding:8px 14px;
             border-radius:12px;
             text-decoration:none;
             font-size:12px;
             font-weight:800;
             white-space:nowrap;
-            transition: background-color .15s ease, border-color .15s ease;
+            transition: background-color .15s ease, border-color .15s ease, transform .12s ease;
         }
         .tg-btn:hover {
-            background: rgba(232,168,124,.16);
-            border-color: rgba(232,168,124,.60);
+            background: var(--accent-soft);
+            border-color: var(--accent);
+            transform: translateY(-1px);
         }
         .pm-stat {
             display:inline-flex;
@@ -680,24 +1127,89 @@ def inject_theme():
             padding:8px 13px;
             margin:4px 7px 10px 0;
             border-radius:12px;
-            background: rgba(232,168,124,.08);
-            border:1px solid rgba(232,168,124,.22);
+            background: var(--accent-tint);
+            border:1px solid var(--accent-soft);
             color: var(--text-secondary);
             font-size:12px;
             font-weight:650;
         }
-        .pm-stat b { color: var(--accent); }
+        .pm-stat b { color: var(--accent-strong); }
+        .pm-stat-grid {
+            display: flex;
+            gap: 12px;
+            margin: 4px 0 16px 0;
+            flex-wrap: wrap;
+        }
+        .pm-stat-card {
+            flex: 1 1 0;
+            min-width: 150px;
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 16px 18px;
+            box-shadow: var(--shadow-sm);
+        }
+        .pm-stat-card .pm-stat-label {
+            font-size: 12px;
+            font-weight: 700;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: .03em;
+            margin-bottom: 6px;
+        }
+        .pm-stat-card .pm-stat-value {
+            font-size: 30px;
+            font-weight: 850;
+            color: var(--accent-strong);
+            line-height: 1.1;
+        }
         code, pre {
-            background: #101016 !important;
-            border: 1px solid rgba(255,255,255,.07) !important;
+            background: var(--code-bg) !important;
+            border: 1px solid var(--border) !important;
             border-radius: 12px !important;
             color: var(--text-secondary) !important;
         }
-        hr { border-color: rgba(255,255,255,.07) !important; }
+        hr { border-color: var(--border) !important; }
         </style>
         """,
         unsafe_allow_html=True,
     )
+    if dark:
+        st.markdown(
+            """
+            <style>
+            :root {
+                --bg: #0f0d12;
+                --bg-soft: #16131a;
+                --card: #1a161f;
+                --card-2: #211c28;
+                --card-hover: #2a252f;
+                --border: #2c2533;
+                --border-strong: #3a3142;
+                --accent: #f0a868;
+                --accent-strong: #f6bd84;
+                --accent-soft: #3a2a1d;
+                --accent-tint: #241a14;
+                --text: #f0e7df;
+                --text-secondary: #b6a695;
+                --text-muted: #7c6d60;
+                --success: #7fd6a1;
+                --success-soft: #16271d;
+                --success-bd: #244a33;
+                --warning: #f0c061;
+                --warning-soft: #2a2113;
+                --warning-bd: #473918;
+                --danger: #f87171;
+                --shadow: 0 18px 44px rgba(0,0,0,.5);
+                --shadow-sm: 0 8px 20px rgba(0,0,0,.4);
+                --hero-glow: #2a1d12;
+                --code-bg: #120f16;
+            }
+            [data-testid="stProgress"] > div { background: #3a3142 !important; }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 def ping_badge(ms):
@@ -709,11 +1221,12 @@ def ping_badge(ms):
 # ══════════════════════════════════════════════════════════════════════════
 #  UI
 # ══════════════════════════════════════════════════════════════════════════
-inject_theme()
+_pm_dark = st.session_state.get("pm_dark", False)
+inject_theme(dark=_pm_dark)
 st.markdown(
     """
     <section class='pm-shell pm-hero'>
-        <div class='pm-badge'>PROXY MANAGER // DARK UI</div>
+        <div class='pm-badge'>PROXY MANAGER // FRESH UI</div>
         <h1>Proxy Manager</h1>
         <p>Сбор MTProto и VLESS из независимых источников. Быстрая дедупликация, TCP/TLS-фильтр и финальная Xray-проверка для рабочих ключей.</p>
         <div class='pm-hero-meta'>
@@ -725,6 +1238,10 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+_tcol_sp, _tcol_tg = st.columns([5, 1])
+with _tcol_tg:
+    st.toggle("🌙 Тёмная", key="pm_dark")
 
 if not XRAY_BIN:
     st.caption(
@@ -796,7 +1313,7 @@ with tab_mtproto:
                 unsafe_allow_html=True,
             )
     else:
-        st.info("Таблица пуста. Нажмите кнопку выше, чтобы запустить сканирование.")
+        st.info("Таблиц�� пуста. Нажмите кнопку выше, чтобы запустить сканирование.")
 
 # ─── Вкладка VLESS ────────────────────────────────────────────────────────
 with tab_vless:
@@ -829,8 +1346,21 @@ with tab_vless:
             "(без ограничения по количеству)."
         )
 
+    with st.expander("Фильтры VLESS перед проверкой", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            security_filter = st.selectbox(
+                "Security", ["Любой", "reality", "tls"], key="vless_security_filter",
+            )
+            only_tcp = st.checkbox("Только type=tcp", key="vless_only_tcp")
+        with c2:
+            require_sni = st.checkbox("Только ключи с SNI/Host", key="vless_require_sni")
+            exclude_ws = st.checkbox("Исключить WebSocket", key="vless_exclude_ws")
+
     enable_xray = False
+    enable_speed = False
     test_url = DEFAULT_TEST_URL
+    speed_url = DEFAULT_SPEED_URL
     if XRAY_BIN:
         enable_xray = st.checkbox(
             "Этап 3: финальная проверка через Xray (реальная работоспособность)",
@@ -841,6 +1371,15 @@ with tab_vless:
                 "URL для теста (должен вернуть 200/204):",
                 value=DEFAULT_TEST_URL, key="vless_test_url",
             )
+            enable_speed = st.checkbox(
+                "Speed-test для найденных ключей (медленнее, но точнее)",
+                value=False, key="vless_enable_speed",
+            )
+            if enable_speed:
+                speed_url = st.text_input(
+                    "URL файла для speed-test:",
+                    value=DEFAULT_SPEED_URL, key="vless_speed_url",
+                )
 
     if own_keys:
         wanted = 0
@@ -849,15 +1388,14 @@ with tab_vless:
             use_container_width=True, key="btn_vless_smart",
         )
     else:
-        col_input, col_btn = st.columns([2, 3])
+        col_input, col_btn = st.columns([3, 2])
         with col_input:
             wanted = st.number_input(
                 "Нужно рабочих ключей:", min_value=1, max_value=500, value=50, step=10,
                 key="vless_wanted",
             )
         with col_btn:
-            st.write("")
-            st.write("")
+            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
             run_smart = st.button(
                 f"Найти {int(wanted)} рабочих ключей",
                 use_container_width=True, key="btn_vless_smart",
@@ -893,6 +1431,19 @@ with tab_vless:
         else:
             with st.spinner("Загружаем и парсим базу ключей..."):
                 all_infos = load_vless_infos()
+
+        if not input_error:
+            before_filter = len(all_infos)
+            all_infos = filter_vless_infos(
+                all_infos,
+                only_reality=(security_filter == "reality"),
+                only_tls=(security_filter == "tls"),
+                only_tcp=only_tcp,
+                exclude_ws=exclude_ws,
+                require_sni=require_sni,
+            )
+            if before_filter != len(all_infos):
+                st.write(f"После фильтров: **{len(all_infos)}** из **{before_filter}** ключей.")
 
         total = len(all_infos)
         # Свои ключи проверяем целиком, без лимита N
@@ -975,9 +1526,27 @@ with tab_vless:
 
             found_keys.sort(key=lambda x: x["ping"])
             found_keys = found_keys[:target]
+
+            if enable_speed and XRAY_BIN and found_keys:
+                speed_bar = st.progress(0.0, text=f"Speed-test: 0 / {len(found_keys)}")
+                done_speed = 0
+                with ThreadPoolExecutor(max_workers=min(4, MAX_XRAY_WORKERS)) as ex:
+                    fmap = {ex.submit(speed_test_vless, item["info"], speed_url): item for item in found_keys}
+                    for fut in as_completed(fmap):
+                        done_speed += 1
+                        fmap[fut]["speed"] = fut.result()
+                        speed_bar.progress(done_speed / len(found_keys), text=f"Speed-test: {done_speed} / {len(found_keys)}")
+                speed_bar.empty()
+
+            for item in found_keys:
+                item["score"] = vless_score(item["info"], item.get("ping"), item.get("speed"))
+            found_keys.sort(key=lambda x: (x.get("score", 0), -(x.get("ping") or 999999)), reverse=True)
+            upsert_working_db(found_keys)
+
             st.session_state.smart_vless_keys = found_keys
             st.session_state.smart_vless_done = True
-            st.session_state.smart_vless_label = check_label
+            st.session_state.smart_vless_label = check_label + (" + speed-test" if enable_speed else "")
+            st.session_state.smart_page = 0
 
             if not found_keys:
                 status_text.error("Не найдено ни одного рабочего ключа.")
@@ -999,20 +1568,52 @@ with tab_vless:
             f"<div class='pm-stat'>сортировка по пингу</div>",
             unsafe_allow_html=True,
         )
-        for si, item in enumerate(smart_keys[:VLESS_TABLE_LIMIT]):
+        SMART_PER_PAGE = 5
+        total_smart_pages = max(1, (len(smart_keys) + SMART_PER_PAGE - 1) // SMART_PER_PAGE)
+        st.session_state.setdefault("smart_page", 0)
+        smart_page = min(st.session_state.smart_page, total_smart_pages - 1)
+        page_slice = smart_keys[smart_page * SMART_PER_PAGE:(smart_page + 1) * SMART_PER_PAGE]
+        for off, item in enumerate(page_slice):
+            si = smart_page * SMART_PER_PAGE + off
             info = item["info"]
+            meta = vless_meta(info)
             display = html.escape(vless_display_name(info))
-            title = html.escape(item["key"], quote=True)
+            host = html.escape(vless_host_display(info))
+            sni = html.escape(meta.get("sni") or "-")
+            score = int(item.get("score") or vless_score(info, item.get("ping"), item.get("speed")))
+            speed = item.get("speed")
+            speed_text = f"{speed} Mbps" if speed is not None else "-"
             st.markdown(
-                f"<div class='pm-row' title=\"{title}\">"
+                f"<div class='pm-row'>"
                 f"<span class='pm-idx'>{si + 1}</span>"
                 f"{ping_badge(item['ping'])}"
-                f"<span class='pm-name'>{display}</span>"
+                f"<span class='pm-name'>{display}<br>"
+                f"<span style='color:var(--text-secondary);font-size:12px;'>"
+                f"{host} · {html.escape(meta['security'])}/{html.escape(meta['network'])} · SNI: {sni} · "
+                f"Speed: {speed_text} · Score: {score} ({score_label(score)})"
+                f"</span></span>"
                 f"</div>",
                 unsafe_allow_html=True,
             )
-        if len(smart_keys) > VLESS_TABLE_LIMIT:
-            st.info(f"Показаны первые {VLESS_TABLE_LIMIT} из {len(smart_keys)}.")
+            with st.expander(f"Ключ #{si + 1}: скопировать"):
+                st.code(item["key"], language=None)
+
+        if total_smart_pages > 1:
+            sp_prev, sp_mid, sp_next = st.columns([1, 2, 1])
+            with sp_prev:
+                if st.button("← Назад", disabled=(smart_page == 0), key="smart_prev", use_container_width=True):
+                    st.session_state.smart_page = smart_page - 1
+                    st.rerun()
+            with sp_mid:
+                st.markdown(
+                    f"<div style='text-align:center;padding-top:12px;color:var(--text-secondary);font-weight:650;'>"
+                    f"Страница {smart_page + 1} из {total_smart_pages}</div>",
+                    unsafe_allow_html=True,
+                )
+            with sp_next:
+                if st.button("Вперёд →", disabled=(smart_page >= total_smart_pages - 1), key="smart_next", use_container_width=True):
+                    st.session_state.smart_page = smart_page + 1
+                    st.rerun()
 
         smart_bytes = "\n".join(item["key"] for item in smart_keys).encode("utf-8")
         st.download_button(
@@ -1020,6 +1621,174 @@ with tab_vless:
             data=smart_bytes, file_name="vless_working.txt",
             mime="text/plain; charset=utf-8", use_container_width=True,
             key="btn_download_smart_vless",
+        )
+        sub_b64 = make_subscription([item["key"] for item in smart_keys])
+        st.download_button(
+            label="Скачать как подписку (base64, vless_sub.txt)",
+            data=sub_b64.encode("utf-8"), file_name="vless_sub.txt",
+            mime="text/plain; charset=utf-8", use_container_width=True,
+            key="btn_download_smart_sub",
+        )
+        with st.expander("Подписка (base64) — скопировать"):
+            st.caption(
+                "Вставьте этот текст как содержимое подписки или импортируйте файл "
+                "vless_sub.txt в клиент (v2rayN, Hiddify, Nekobox, Streisand)."
+            )
+            st.code(sub_b64, language=None)
+
+    st.markdown("---")
+    st.markdown("### Рабочая база")
+    working_db = load_working_db()
+    if working_db:
+        last_ping_vals = [int(x.get("ping", 0)) for x in working_db if int(x.get("ping", 0)) > 0]
+        _best_score = max(int(x.get("score", 0)) for x in working_db)
+        _best_ping = f"{min(last_ping_vals)} ms" if last_ping_vals else "-"
+        st.markdown(
+            f"""
+            <div class='pm-stat-grid'>
+                <div class='pm-stat-card'>
+                    <div class='pm-stat-label'>Ключей в базе</div>
+                    <div class='pm-stat-value'>{len(working_db)}</div>
+                </div>
+                <div class='pm-stat-card'>
+                    <div class='pm-stat-label'>Лучший score</div>
+                    <div class='pm-stat-value'>{_best_score}</div>
+                </div>
+                <div class='pm-stat-card'>
+                    <div class='pm-stat-label'>Лучший ping</div>
+                    <div class='pm-stat-value'>{_best_ping}</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        db_col1, db_col2 = st.columns(2)
+        with db_col1:
+            if st.button("Перепроверить рабочую базу", key="btn_recheck_working", use_container_width=True):
+                rechecked = []
+                infos = [parse_vless(x.get("key", "")) for x in working_db]
+                infos = [i for i in infos if i]
+                if infos:
+                    with st.spinner("Перепроверяем старые рабочие ключи..."):
+                        with ThreadPoolExecutor(max_workers=MAX_XRAY_WORKERS if XRAY_BIN else MAX_TCP_WORKERS) as ex:
+                            if XRAY_BIN:
+                                fmap = {ex.submit(url_test_vless, i, DEFAULT_TEST_URL): i for i in infos}
+                            else:
+                                fmap = {ex.submit(check_tcp_ping, i["host"], i["port"], 1.0): i for i in infos}
+                            for fut in as_completed(fmap):
+                                ping = fut.result()
+                                if ping is not None:
+                                    info = fmap[fut]
+                                    rechecked.append({"info": info, "key": info["raw"], "ping": ping})
+                    save_working_db([])
+                    upsert_working_db(rechecked)
+                    st.success(f"Живых после перепроверки: {len(rechecked)}")
+                    st.rerun()
+        with db_col2:
+            if st.button("Очистить рабочую базу", key="btn_clear_working", type="primary", use_container_width=True):
+                try:
+                    os.remove(WORKING_DB_FILE)
+                except Exception:
+                    pass
+                st.rerun()
+
+        top_db = sorted(working_db, key=lambda x: int(x.get("score", 0)), reverse=True)
+        WORK_PER_PAGE = 5
+        total_work_pages = max(1, (len(top_db) + WORK_PER_PAGE - 1) // WORK_PER_PAGE)
+        st.session_state.setdefault("working_page", 0)
+        work_page = min(st.session_state.working_page, total_work_pages - 1)
+        work_slice = top_db[work_page * WORK_PER_PAGE:(work_page + 1) * WORK_PER_PAGE]
+        for off, rec in enumerate(work_slice):
+            idx = work_page * WORK_PER_PAGE + off
+            name = html.escape(rec.get("name") or rec.get("host") or "VLESS")
+            host = html.escape(f"{rec.get('host','')}:{rec.get('port','')}")
+            score = int(rec.get("score", 0))
+            ping = rec.get("ping", "-")
+            speed = rec.get("speed")
+            speed_text = f"{speed} Mbps" if speed is not None else "-"
+            st.markdown(
+                f"<div class='pm-row'>"
+                f"<span class='pm-idx'>{idx + 1}</span>"
+                f"<span class='ping-badge'>{ping} мс</span>"
+                f"<span class='pm-name'>{name}<br>"
+                f"<span style='color:var(--text-secondary);font-size:12px;'>"
+                f"{host} · {html.escape(rec.get('security',''))}/{html.escape(rec.get('network',''))} · "
+                f"Speed: {speed_text} · Score: {score} ({score_label(score)}) · {html.escape(rec.get('last_checked',''))}"
+                f"</span></span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        if total_work_pages > 1:
+            wp_prev, wp_mid, wp_next = st.columns([1, 2, 1])
+            with wp_prev:
+                if st.button("← Назад", disabled=(work_page == 0), key="work_prev", use_container_width=True):
+                    st.session_state.working_page = work_page - 1
+                    st.rerun()
+            with wp_mid:
+                st.markdown(
+                    f"<div style='text-align:center;padding-top:12px;color:var(--text-secondary);font-weight:650;'>"
+                    f"Страница {work_page + 1} из {total_work_pages}</div>",
+                    unsafe_allow_html=True,
+                )
+            with wp_next:
+                if st.button("Вперёд →", disabled=(work_page >= total_work_pages - 1), key="work_next", use_container_width=True):
+                    st.session_state.working_page = work_page + 1
+                    st.rerun()
+        db_keys = [x["key"] for x in working_db if x.get("key")]
+        st.download_button("Скачать рабочую базу (working_vless.txt)", "\n".join(db_keys).encode("utf-8"),
+                           file_name="working_vless.txt", mime="text/plain; charset=utf-8",
+                           use_container_width=True, key="btn_download_working_db")
+        st.download_button("Скачать рабочую базу как подписку", make_subscription(db_keys).encode("utf-8"),
+                           file_name="working_vless_sub.txt", mime="text/plain; charset=utf-8",
+                           type="primary", use_container_width=True, key="btn_download_working_db_sub")
+    else:
+        st.info("Рабочая база пока пуста. После умного подбора найденные ключи сохранятся сюда автоматически.")
+
+    st.markdown("---")
+    st.markdown("### История источников")
+    st.caption(
+        "График показывает, сколько vless-ключей отдавал каждый источник при "
+        "каждом обновлении базы — видно, какие репозитории деградируют."
+    )
+    _hist = load_history()
+    if _hist:
+        rows = []
+        for rec in _hist:
+            row = {"Время": rec.get("ts", "")}
+            row.update(rec.get("counts", {}))
+            rows.append(row)
+        hist_df = pd.DataFrame(rows).set_index("Время").fillna(0)
+        total_series = hist_df.sum(axis=1)
+        c1, c2 = st.columns(2)
+        c1.metric("Замеров в истории", len(_hist))
+        c2.metric("Всего ключей (последний замер)", int(total_series.iloc[-1]))
+        view = st.radio(
+            "Что показать:", ["Всего по времени", "По источникам"],
+            horizontal=True, key="hist_view",
+        )
+        if view == "Всего по времени":
+            series = total_series.tail(14)
+            render_bar_chart([
+                (str(idx).split(" ")[-1], val)
+                for idx, val in zip(series.index, series.values)
+            ])
+        else:
+            last_row = hist_df.iloc[-1].sort_values(ascending=False)
+            last_row = last_row[last_row > 0].head(14)
+            render_bar_chart([
+                (str(src), val) for src, val in zip(last_row.index, last_row.values)
+            ])
+        if st.button("Очистить историю", key="btn_clear_history"):
+            try:
+                os.remove(HISTORY_FILE)
+            except Exception:
+                pass
+            st.rerun()
+    else:
+        st.info(
+            "История пока пуста. Нажмите «Загрузить / Обновить VLESS ключи» ниже — "
+            "каждое обновление добавляет замер."
         )
 
     st.markdown("---")
@@ -1044,12 +1813,21 @@ with tab_vless:
                 stats[name] = count
             st.session_state.vless_keys = sorted(unique_vless)
             st.session_state.vless_loaded = True
+            st.session_state.vless_source_health = [
+                {"Источник": k, "Ключей": int(v), "Статус": "OK" if int(v) > 0 else "Пусто/ошибка"}
+                for k, v in stats.items()
+            ]
+            append_history(stats)
             st.success(
                 "Загружено: "
                 + " | ".join(f"**{k}**: {v}" for k, v in stats.items())
             )
 
     st.markdown("---")
+    if st.session_state.get("vless_source_health"):
+        with st.expander("Здоровье источников", expanded=True):
+            st.dataframe(pd.DataFrame(st.session_state.vless_source_health), use_container_width=True)
+
     if st.session_state.vless_keys:
         keys = st.session_state.vless_keys
         st.write(f"Найдено уникальных VLESS ключей: **{len(keys)}**")
@@ -1110,6 +1888,13 @@ with tab_vless:
             data=all_keys_bytes, file_name="vless_keys.txt",
             mime="text/plain; charset=utf-8", use_container_width=True,
             key="btn_download_vless",
+        )
+        all_sub_b64 = make_subscription(st.session_state.vless_keys)
+        st.download_button(
+            label="Скачать все как подписку (base64)",
+            data=all_sub_b64.encode("utf-8"), file_name="vless_sub_all.txt",
+            mime="text/plain; charset=utf-8", use_container_width=True,
+            key="btn_download_vless_sub",
         )
         st.text_area(
             label="Все уникальные VLESS ключи",
