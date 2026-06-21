@@ -118,15 +118,31 @@ jobs:
           YANDEX_DISK_TOKEN: ${{ secrets.YANDEX_DISK_TOKEN }}
         run: |
           # Получаем URL для загрузки (overwrite=true — перезаписывать)
-          UPLOAD_URL=$(curl -s -X GET \
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X GET \
             "https://cloud-api.yandex.net/v1/disk/resources/upload?path=apps/VLESS%20Keys/vless.txt&overwrite=true" \
-            -H "Authorization: OAuth ${YANDEX_DISK_TOKEN}" \
-            | python3 -c "import sys,json; print(json.load(sys.stdin)['href'])")
+            -H "Authorization: OAuth ${YANDEX_DISK_TOKEN}")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "Yandex Disk API response (HTTP $HTTP_CODE): $BODY"
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "❌ Failed to get upload URL (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+
+          UPLOAD_URL=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin)['href'])")
 
           # Загружаем файл
-          curl -s -X PUT \
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
             -H "Authorization: OAuth ${YANDEX_DISK_TOKEN}" \
             --data-binary "@vless.txt" \
-            "$UPLOAD_URL"
+            "$UPLOAD_URL")
 
-          echo "✅ vless.txt uploaded to Yandex Disk"
+          if [ "$HTTP_CODE" -eq 201 ] || [ "$HTTP_CODE" -eq 200 ]; then
+            echo "✅ vless.txt uploaded to Yandex Disk"
+          else
+            echo "❌ Failed to upload file (HTTP $HTTP_CODE)"
+            exit 1
+          fi
