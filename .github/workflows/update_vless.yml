@@ -121,6 +121,11 @@ jobs:
           # Название приложения на Яндекс.OAuth должно точно совпадать!
           DISK_PATH="apps/VLESS Collector/vless.txt"
 
+          # Создаём родительскую папку (игнорируем ошибку если уже существует)
+          curl -s -X PUT \
+            "https://cloud-api.yandex.net/v1/disk/resources?path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('apps/VLESS Collector'))")" \
+            -H "Authorization: OAuth ${YANDEX_DISK_TOKEN}" > /dev/null 2>&1 || true
+
           RESPONSE=$(curl -s -w "\n%{http_code}" -X GET \
             "https://cloud-api.yandex.net/v1/disk/resources/upload?path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$DISK_PATH'))")&overwrite=true" \
             -H "Authorization: OAuth ${YANDEX_DISK_TOKEN}")
