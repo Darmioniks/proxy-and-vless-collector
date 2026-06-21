@@ -93,14 +93,40 @@ jobs:
           print(f"vless.txt written with {total} unique keys.")
           EOF
 
+      - name: Check for changes
+        id: check_changes
+        run: |
+          git add vless.txt
+          if git diff --staged --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No changes to vless.txt, skipping commit and upload."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Commit and push vless.txt
+        if: steps.check_changes.outputs.changed == 'true'
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add vless.txt
-          if git diff --staged --quiet; then
-            echo "No changes to vless.txt, skipping commit."
-          else
-            git commit -m "chore: update vless.txt [$(date -u +'%Y-%m-%d %H:%M UTC')]"
-            git push
-          fi
+          git commit -m "chore: update vless.txt [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+          git push
+
+      - name: Upload vless.txt to Yandex Disk
+        if: steps.check_changes.outputs.changed == 'true'
+        env:
+          YANDEX_DISK_TOKEN: ${{ secrets.YANDEX_DISK_TOKEN }}
+        run: |
+          # Получаем URL для загрузки (overwrite=true — перезаписывать)
+          UPLOAD_URL=$(curl -s -X GET \
+            "https://cloud-api.yandex.net/v1/disk/resources/upload?path=apps/VLESS%20Keys/vless.txt&overwrite=true" \
+            -H "Authorization: OAuth ${YANDEX_DISK_TOKEN}" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['href'])")
+
+          # Загружаем файл
+          curl -s -X PUT \
+            -H "Authorization: OAuth ${YANDEX_DISK_TOKEN}" \
+            --data-binary "@vless.txt" \
+            "$UPLOAD_URL"
+
+          echo "✅ vless.txt uploaded to Yandex Disk"
