@@ -13,7 +13,8 @@ PROXY_SOURCES = [
     "https://raw.githubusercontent.com/SoliSpirit/mtproto/master/all_proxies.txt",
     "https://raw.githubusercontent.com/ALIILAPRO/MTProtoProxy/main/mtproto.txt",
     "https://raw.githubusercontent.com/Grim1313/mtproto-for-telegram/master/all_proxies.txt",
-    "https://raw.githubusercontent.com/Argh94/telegram-proxy-scraper/main/proxy.txt"
+    "https://raw.githubusercontent.com/Argh94/telegram-proxy-scraper/main/proxy.txt",
+    "https://raw.githubusercontent.com/horizonpaz-create/mtproto-live/main/mtproto.txt"
 ]
 
 # Список источников VLESS ключей
