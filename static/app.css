@@ -253,8 +253,9 @@ summary { cursor: pointer; font-size: 13px; font-weight: 600; }
 .working-row > span { color: var(--muted); font-size: 12px; }
 .working-row .score { color: var(--accent); font-weight: 700; }
 
-.telegram-toolbar { display: grid; grid-template-columns: minmax(180px, 260px) minmax(190px, 230px); gap: 12px; align-items: end; }
-.telegram-toolbar .field { margin: 0; }
+.telegram-toolbar { display: grid; grid-template-columns: minmax(360px, 1fr) minmax(190px, 230px); gap: 18px; align-items: center; }
+.telegram-toolbar .field { grid-template-columns: max-content minmax(120px, 1fr); align-items: center; gap: 14px; margin: 0; }
+.telegram-toolbar .field > span { line-height: 1.3; }
 .telegram-toolbar .primary-button { height: 41px; }
 .telegram-status { min-height: 20px; margin: 18px 0 10px; color: var(--muted); font-size: 12px; }
 .telegram-list { border-top: 1px solid var(--line); }
@@ -296,6 +297,7 @@ summary { cursor: pointer; font-size: 13px; font-weight: 600; }
     .working-row { grid-template-columns: 36px 1fr; }
     .working-row > span { grid-column: 2; }
     .telegram-toolbar { grid-template-columns: 1fr; }
+    .telegram-toolbar .field { grid-template-columns: 1fr; gap: 7px; }
     .telegram-row { grid-template-columns: 32px 1fr auto; }
     .telegram-row .secondary-button { grid-column: 2 / -1; justify-self: start; }
 }
