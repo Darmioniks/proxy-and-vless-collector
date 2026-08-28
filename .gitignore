@@ -16,3 +16,9 @@ vless_working.txt
 vless_keys.txt
 *.log
 .DS_Store
+history.json
+proxy_manager.db
+subscriptions.json
+working_vless.json
+build/
+dist/

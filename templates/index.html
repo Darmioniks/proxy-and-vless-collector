@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>Proxy Manager</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22><rect width=%2264%22 height=%2264%22 rx=%2218%22 fill=%22%23ff6b35%22/><text x=%2232%22 y=%2242%22 text-anchor=%22middle%22 font-size=%2234%22 font-family=%22Arial%22 font-weight=%22900%22 fill=%22white%22>P</text></svg>">
+    <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
+</head>
+<body>
+<div class="layout">
+    <aside class="sidebar">
+        <a class="brand" href="/" aria-label="Proxy Manager">
+            <span class="brand-mark">P</span>
+            <span><strong>Proxy</strong><small>Manager</small></span>
+        </a>
+        <nav>
+            <button class="nav-item active" data-view="search-view">
+                Поиск ключей
+            </button>
+            <button class="nav-item" data-view="working-view">
+                Рабочая база
+            </button>
+            <button class="nav-item" data-view="telegram-view">
+                Telegram-прокси
+            </button>
+        </nav>
+        {% if desktop %}
+        <section class="desktop-happ-card">
+            <strong>Happ</strong>
+            <small>Импорт vless_filtered.txt из GitHub</small>
+            <button id="happ-connect-button" type="button" disabled>
+                Добавить в Happ
+            </button>
+            <p id="happ-connect-status" class="desktop-happ-status"></p>
+        </section>
+        {% endif %}
+        <div class="side-status">
+            <span class="status-dot {{ 'online' if xray else 'warning' }}"></span>
+            <div>
+                <strong>Xray {{ 'подключён' if xray else 'не найден' }}</strong>
+                <small>{{ 'Строгая проверка доступна' if xray else 'Только TCP и TLS' }}</small>
+            </div>
+        </div>
+        <button id="theme-toggle" class="theme-button" type="button">Сменить тему</button>
+    </aside>
+
+    <main>
+        <section id="search-view" class="view active">
+            <header class="page-header">
+                <div>
+                    <h1>Поиск рабочих ключей</h1>
+                    <p>Каждый ключ проходит TCP, TLS и Xray отдельно. Результаты появляются сразу.</p>
+                </div>
+                <div class="pipeline" aria-label="Этапы проверки">
+                    <span>TCP</span><i></i><span>TLS</span><i></i><span>XRAY</span>
+                </div>
+            </header>
+
+            <div class="content-grid">
+                <form id="job-form" class="panel form-panel">
+                    <div class="panel-title">
+                        <div><small>Новое задание</small><h2>Параметры поиска</h2></div>
+                    </div>
+
+                    <label class="field">
+                        <span>Сколько ключей нужно</span>
+                        <input id="count" type="number" min="1" max="100" value="10" required>
+                    </label>
+
+                    <div class="field">
+                        <span>Источник</span>
+                        <div class="segmented">
+                            <label><input type="radio" name="source" value="remote" checked><span>Общая база</span></label>
+                            <label><input type="radio" name="source" value="custom"><span>Свои ключи</span></label>
+                        </div>
+                    </div>
+
+                    <div id="custom-source" class="custom-source hidden">
+                        <label class="upload" for="key-file">
+                            <strong>Выбрать .txt</strong>
+                            <small id="file-label">или вставьте ключи ниже</small>
+                        </label>
+                        <input id="key-file" type="file" accept=".txt,text/plain" hidden>
+                        <textarea id="key-text" rows="5" placeholder="vless://...&#10;vless://..."></textarea>
+                    </div>
+
+                    <div class="field country-field">
+                        <span>Разрешённые страны</span>
+                        <input id="country-search" list="country-options" autocomplete="off" placeholder="Начните вводить: Россия, Германия…">
+                        <datalist id="country-options"></datalist>
+                        <div id="country-chips" class="country-chips"></div>
+                        <small>Если список пуст, разрешены все страны.</small>
+                    </div>
+
+                    <div class="field country-field">
+                        <span>Чёрный список стран</span>
+                        <input id="excluded-country-search" list="country-options" autocomplete="off" placeholder="Страны, которые нужно исключить">
+                        <div id="excluded-country-chips" class="country-chips excluded"></div>
+                        <small>Эти страны будут удалены до TCP-проверки. Серверы с неизвестной страной останутся.</small>
+                    </div>
+
+                    <details>
+                        <summary>Фильтры и ограничения</summary>
+                        <div class="details-grid">
+                            <label class="field"><span>Security</span>
+                                <select id="security"><option value="any">Любой</option><option value="reality">Reality</option><option value="tls">TLS</option></select>
+                            </label>
+                            <div class="limit-field">
+                                <label class="field"><span>Максимум проверок</span><input id="max-checks" type="number" min="10" max="100000" value="2000"></label>
+                                <label class="check"><input id="unlimited-checks" type="checkbox"><span>Без лимита</span></label>
+                            </div>
+                            <label class="check"><input id="only-tcp" type="checkbox"><span>Только TCP transport</span></label>
+                            <label class="check"><input id="require-sni" type="checkbox"><span>Требовать SNI/Host</span></label>
+                            <label class="check"><input id="exclude-ws" type="checkbox"><span>Исключить WebSocket</span></label>
+                            <label class="check"><input id="speed" type="checkbox" {{ '' if xray else 'disabled' }}><span>Замерить скорость после поиска</span></label>
+                        </div>
+                    </details>
+
+                    <label class="check xray-check">
+                        <input id="enable-xray" type="checkbox" {{ 'checked' if xray else 'disabled' }}>
+                        <span><strong>Строгая Xray-проверка</strong><small>2 независимых ответа и загрузка 256 КБ</small></span>
+                    </label>
+
+                    <button id="start-button" class="primary-button" type="submit">
+                        <span>Начать поиск</span><b>→</b>
+                    </button>
+                    <p id="form-error" class="error hidden"></p>
+                </form>
+
+                <section class="panel progress-panel">
+                    <div class="panel-title">
+                        <div><small>Ход проверки</small><h2 id="job-title">Ожидает запуска</h2></div>
+                        <span id="job-state" class="state idle">IDLE</span>
+                    </div>
+                    <div class="target-ring" id="target-ring">
+                        <div><strong id="found-count">0</strong><span id="target-count">из 10</span></div>
+                    </div>
+                    <p id="job-message" class="job-message">Настройте поиск и запустите проверку.</p>
+                    <div class="metrics">
+                        <div><span>Проверено</span><strong id="checked-count">0</strong></div>
+                        <div><span>TCP отсев</span><strong id="tcp-failed">0</strong></div>
+                        <div><span>TLS отсев</span><strong id="tls-failed">0</strong></div>
+                        <div><span>Xray отсев</span><strong id="xray-failed">0</strong></div>
+                        <div class="geo-metric"><span>Страна подошла</span><strong id="geo-matched">0</strong></div>
+                    </div>
+                    <div class="progress-line"><i id="progress-fill"></i></div>
+                    <div class="progress-actions">
+                        <button id="stop-button" class="secondary-button" type="button" disabled>Остановить</button>
+                        <a id="download-button" class="secondary-button disabled" href="#">Скачать TXT</a>
+                    </div>
+                </section>
+            </div>
+
+            <section class="results-section">
+                <div class="section-title">
+                    <div><h2>Найденные ключи</h2><p>Список обновляется во время проверки</p></div>
+                    <button id="subscription-button" class="secondary-button" type="button" disabled>Создать подписку</button>
+                </div>
+                <div id="subscription-box" class="subscription-box hidden"></div>
+                <div id="results" class="results empty">
+                    <div class="empty-state"><strong>Результатов пока нет</strong><p>Первый рабочий ключ появится здесь сразу после проверки.</p></div>
+                </div>
+            </section>
+        </section>
+
+        <section id="working-view" class="view">
+            <header class="page-header compact">
+                <div><h1>Рабочая база</h1><p>Ключи, которые фактически прошли проверку.</p></div>
+                <button id="refresh-working" class="secondary-button" type="button">Обновить</button>
+            </header>
+            <div id="working-list" class="working-list"></div>
+        </section>
+
+        <section id="telegram-view" class="view">
+            <header class="page-header compact">
+                <div><h1>Telegram-прокси</h1><p>MTProto-прокси из публичных источников с дедупликацией и TCP-проверкой.</p></div>
+            </header>
+            <section class="panel telegram-panel">
+                <div class="telegram-toolbar">
+                    <label class="field"><span>Сколько прокси проверить</span><input id="telegram-limit" type="number" min="1" max="500" value="80"></label>
+                    <button id="telegram-refresh" class="primary-button" type="button">Загрузить и проверить</button>
+                </div>
+                <p id="telegram-status" class="telegram-status">Проверка ещё не запускалась.</p>
+                <div id="telegram-list" class="telegram-list empty">
+                    <div class="empty-state telegram-empty"><span class="empty-face">:'(</span><strong>Прокси пока не загружены</strong><p>Запустите проверку, чтобы получить доступные MTProto-прокси.</p></div>
+                </div>
+            </section>
+        </section>
+    </main>
+</div>
+<script>
+    window.PM_XRAY = {{ 'true' if xray else 'false' }};
+    window.PM_DESKTOP = {{ 'true' if desktop else 'false' }};
+</script>
+<script src="{{ url_for('static', path='/app.js') }}"></script>
+</body>
+</html>

@@ -18,6 +18,8 @@ requirements.txt:
 Скачать: https://github.com/XTLS/Xray-core/releases
 """
 
+import sys
+import asyncio
 import streamlit as st
 import requests
 import urllib.parse
@@ -32,10 +34,22 @@ import shutil
 import tempfile
 import base64
 import subprocess
+import secrets
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
+
+# На Windows (Python 3.13/3.14) asyncio-ProactorLoop иногда печатает в консоль
+# безобидную ConnectionResetError [WinError 10054] при разрыве соединения
+# браузером. Селекторный цикл убирает этот шум и на работу не влияет.
+if sys.platform.startswith("win"):
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
 
 # ──────────────────────────────────────────────────────────────────────────
 #  Конфигурация
@@ -49,6 +63,17 @@ MAX_TCP_WORKERS = 100           # параллельных TCP-проверок
 MAX_TLS_WORKERS = 60            # параллельных TLS-handshake проверок
 MAX_XRAY_WORKERS = 8            # параллельных xray url-тестов (тяжелее)
 DEFAULT_TEST_URL = "https://www.gstatic.com/generate_204"
+# Мультипроверка: несколько независимых хостов (ловит whitelist-only сервера)
+VALIDATION_URLS = [
+    "https://www.gstatic.com/generate_204",
+    "https://cp.cloudflare.com/generate_204",
+    "https://www.google.com/generate_204",
+    "https://connectivitycheck.gstatic.com/generate_204",
+]
+VALIDATION_MIN_SUCCESS = 2      # сколько хостов из списка должны ответить
+# Реальная докачка блока данных (ловит "отвечает, но не качает")
+VALIDATION_DOWNLOAD_URL = "https://speed.cloudflare.com/__down?bytes=1000000"
+VALIDATION_MIN_BYTES = 256 * 1024   # минимум реально скачанных байт
 HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (ProxyManager/1.0)"}
 
 PROXY_SOURCES = [
@@ -88,6 +113,9 @@ HISTORY_FILE = os.path.join(_here, "history.json")
 HISTORY_LIMIT = 300
 WORKING_DB_FILE = os.path.join(_here, "working_vless.json")
 WORKING_DB_LIMIT = 1000
+SUBS_FILE = os.path.join(_here, "subscriptions.json")
+SUB_SERVER_PORT = int(os.environ.get("PM_SUB_PORT", "8765"))
+SUB_HOST_OVERRIDE = os.environ.get("PM_SUB_HOST", "").strip()  # публичный домен/IP для мобильного интернета
 DEFAULT_SPEED_URL = "https://speed.cloudflare.com/__down?bytes=1000000"
 
 
@@ -310,6 +338,7 @@ def url_test_vless(info, test_url=DEFAULT_TEST_URL, timeout=8):
             [XRAY_BIN, "run", "-c", cfg_path],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         time.sleep(0.8)  # даём xray стартовать
 
@@ -317,11 +346,53 @@ def url_test_vless(info, test_url=DEFAULT_TEST_URL, timeout=8):
             "http": f"socks5h://127.0.0.1:{socks_port}",
             "https": f"socks5h://127.0.0.1:{socks_port}",
         }
-        start = time.time()
-        r = requests.get(test_url, proxies=proxies, timeout=timeout, headers=HTTP_HEADERS)
-        if r.status_code in (200, 204):
-            return int((time.time() - start) * 1000)
-        return None
+
+        # --- Этап 1: мультипроверка нескольких независимых хостов ---
+        check_urls = []
+        for u in [test_url] + VALIDATION_URLS:
+            if u and u not in check_urls:
+                check_urls.append(u)
+        successes = 0
+        best_ping = None
+        for u in check_urls:
+            try:
+                start = time.time()
+                r = requests.get(u, proxies=proxies, timeout=timeout, headers=HTTP_HEADERS)
+                if r.status_code in (200, 204):
+                    successes += 1
+                    ping = int((time.time() - start) * 1000)
+                    if best_ping is None or ping < best_ping:
+                        best_ping = ping
+                    if successes >= VALIDATION_MIN_SUCCESS:
+                        break
+            except Exception:
+                continue
+        if successes < VALIDATION_MIN_SUCCESS:
+            return None
+
+        # --- Этап 2: реальная докачка блока данных ---
+        try:
+            dl_start = time.time()
+            rd = requests.get(
+                VALIDATION_DOWNLOAD_URL, proxies=proxies, timeout=timeout,
+                headers=HTTP_HEADERS, stream=True,
+            )
+            if rd.status_code not in (200, 204):
+                return None
+            size = 0
+            for chunk in rd.iter_content(chunk_size=65536):
+                if chunk:
+                    size += len(chunk)
+                if size >= VALIDATION_MIN_BYTES:
+                    break
+                if time.time() - dl_start > timeout:
+                    break
+            if size < VALIDATION_MIN_BYTES:
+                return None
+        except Exception:
+            return None
+
+        return best_ping
     except Exception:
         return None
     finally:
@@ -368,6 +439,7 @@ def speed_test_vless(info, speed_url=DEFAULT_SPEED_URL, timeout=12):
             [XRAY_BIN, "run", "-c", cfg_path],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         time.sleep(0.8)
         proxies = {
@@ -457,6 +529,188 @@ def make_subscription(keys):
     """base64-подписка из списка vless-ключей (импорт одной ссылкой)."""
     blob = "\n".join(keys).strip()
     return base64.b64encode(blob.encode("utf-8")).decode("ascii")
+
+
+def rename_vless_key(raw, new_name):
+    """Меняет метку (#fragment) ключа vless:// на new_name."""
+    base = raw.split("#", 1)[0]
+    return base + "#" + urllib.parse.quote(new_name, safe="")
+
+
+def resolve_ip(host):
+    try:
+        return socket.gethostbyname(host)
+    except Exception:
+        return None
+
+
+def lookup_countries(hosts):
+    """Best-effort определение страны (countryCode) по хостам через ip-api.com."""
+    hosts = [h for h in set(hosts) if h]
+    if not hosts:
+        return {}
+    host_ip = {}
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        fmap = {ex.submit(resolve_ip, h): h for h in hosts}
+        for fut in as_completed(fmap):
+            ip = fut.result()
+            if ip:
+                host_ip[fmap[fut]] = ip
+    ip_country = {}
+    uniq = list({ip for ip in host_ip.values()})
+    for i in range(0, len(uniq), 100):
+        chunk = uniq[i:i + 100]
+        try:
+            resp = requests.post(
+                "http://ip-api.com/batch?fields=countryCode,query",
+                json=[{"query": ip} for ip in chunk],
+                timeout=8, headers=HTTP_HEADERS,
+            )
+            for row in resp.json():
+                ip_country[row.get("query")] = row.get("countryCode") or ""
+        except Exception:
+            pass
+    return {h: ip_country.get(ip, "") for h, ip in host_ip.items()}
+
+
+# ─────────────────────────────────────────────────────────
+#  Локальный сервер подписок (ссылка для Happ / v2rayN / Hiddify и т.д.)
+# ─────────────────────────────────────────────────────────
+def load_subs():
+    try:
+        with open(SUBS_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_subs(subs):
+    try:
+        with open(SUBS_FILE, "w", encoding="utf-8") as fh:
+            json.dump(subs, fh, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def cleanup_subs(subs):
+    """Убирает подписки, истёкшие более часа назад."""
+    now = time.time()
+    return {
+        t: v for t, v in subs.items()
+        if not v.get("expires") or v["expires"] > now - 3600
+    }
+
+
+def create_subscription_entry(keys, ttl_minutes=None, name=""):
+    """Создаёт запись подписки, возвращает (token, expires_epoch|None)."""
+    subs = cleanup_subs(load_subs())
+    token = secrets.token_urlsafe(9)
+    expires = None
+    if ttl_minutes and ttl_minutes > 0:
+        expires = time.time() + ttl_minutes * 60
+    subs[token] = {
+        "b64": make_subscription(keys),
+        "count": len(keys),
+        "created": time.time(),
+        "expires": expires,
+        "name": name or "VLESS subscription",
+    }
+    save_subs(subs)
+    return token, expires
+
+
+def delete_subscription(token):
+    subs = load_subs()
+    if token in subs:
+        del subs[token]
+        save_subs(subs)
+
+
+def fmt_remaining(expires):
+    """Человечный остаток времени до истечения ссылки."""
+    if not expires:
+        return "без ограничения"
+    left = int(expires - time.time())
+    if left <= 0:
+        return "истекла"
+    h, rem = divmod(left, 3600)
+    m = rem // 60
+    d, h = divmod(h, 24)
+    if d:
+        return f"{d} дн {h} ч"
+    if h:
+        return f"{h} ч {m} мин"
+    return f"{m} мин"
+
+
+def get_lan_ip():
+    """Локальный IP в сети (чтобы открыть ссылку с телефона в той же сети)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+
+class _SubHandler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        try:
+            self._do_get()
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+
+    def _do_get(self):
+        path = urllib.parse.urlparse(self.path).path
+        if not path.startswith("/sub/"):
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"Not found")
+            return
+        token = path[len("/sub/"):].strip("/")
+        entry = load_subs().get(token)
+        if not entry:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"Subscription not found")
+            return
+        exp = entry.get("expires")
+        if exp and time.time() > exp:
+            self.send_response(410)
+            self.end_headers()
+            self.wfile.write(b"Subscription expired")
+            return
+        body = (entry.get("b64") or "").encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Profile-Update-Interval", "12")
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@st.cache_resource
+def start_sub_server(preferred_port):
+    """Запускает фоновый HTTP-сервер подписок один раз на процесс."""
+    last_err = None
+    for p in range(preferred_port, preferred_port + 10):
+        try:
+            server = ThreadingHTTPServer(("0.0.0.0", p), _SubHandler)
+            server.daemon_threads = True
+            server.allow_reuse_address = True
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            return {"ok": True, "port": p}
+        except OSError as e:
+            last_err = e
+            continue
+    return {"ok": False, "port": preferred_port, "error": str(last_err)}
 
 
 def load_history():
@@ -656,6 +910,60 @@ def run_stage(label, items, worker_fn, max_workers, report_every=20):
                              text=f"{label}: {done} / {total} (прошло: {len(ok)})")
     bar.empty()
     return ok
+
+
+def run_full_cascade(infos, enable_xray=True, test_url=DEFAULT_TEST_URL):
+    """Полный каскад TCP -> TLS -> Xray. Возвращает list[{info,key,ping}], отсортировано по пингу."""
+    if not infos:
+        return []
+    endpoints = sorted({(i["host"], i["port"]) for i in infos})
+    tcp_ok = run_stage(
+        "Этап 1/3 — TCP", endpoints,
+        lambda hp: check_tcp_ping(hp[0], hp[1], 1.0),
+        MAX_TCP_WORKERS, report_every=25,
+    )
+    after_tcp = [i for i in infos if (i["host"], i["port"]) in tcp_ok]
+    st.write(f"После TCP: **{len(after_tcp)}** из **{len(infos)}** ключей.")
+
+    need_tls = [i for i in after_tcp if vless_security(i) in ("tls", "reality")]
+    passthrough = [i for i in after_tcp if vless_security(i) not in ("tls", "reality")]
+    tls_targets = sorted({(i["host"], i["port"], vless_sni(i)) for i in need_tls})
+    tls_ok = run_stage(
+        "Этап 2/3 — TLS", tls_targets,
+        lambda t: check_tls_handshake(t[0], t[1], t[2], 2.5),
+        MAX_TLS_WORKERS, report_every=20,
+    )
+    after_tls = passthrough + [
+        i for i in need_tls if (i["host"], i["port"], vless_sni(i)) in tls_ok
+    ]
+    st.write(f"После TLS: **{len(after_tls)}** ключей.")
+
+    found = []
+    if enable_xray and XRAY_BIN:
+        total_t = len(after_tls)
+        bar = st.progress(0.0, text=f"Этап 3/3 — Xray: 0 / {total_t}")
+        checked = 0
+        with ThreadPoolExecutor(max_workers=MAX_XRAY_WORKERS) as ex:
+            fmap = {ex.submit(url_test_vless, i, test_url): i for i in after_tls}
+            for fut in as_completed(fmap):
+                checked += 1
+                ping = fut.result()
+                if ping is not None:
+                    info = fmap[fut]
+                    found.append({"info": info, "key": info["raw"], "ping": ping})
+                if checked % 3 == 0 or checked == total_t:
+                    bar.progress(
+                        checked / max(total_t, 1),
+                        text=f"Этап 3/3 — Xray: рабочих {len(found)} (проверено {checked} / {total_t})",
+                    )
+        bar.empty()
+    else:
+        for info in after_tls:
+            ping = check_tcp_ping(info["host"], info["port"], 1.0) or 0
+            found.append({"info": info, "key": info["raw"], "ping": ping})
+
+    found.sort(key=lambda x: x["ping"])
+    return found
 
 
 def divider(alpha="0.05"):
@@ -1249,7 +1557,7 @@ if not XRAY_BIN:
         "Для url-теста положите бинарь `xray` рядом с приложением или в PATH."
     )
 
-tab_mtproto, tab_vless = st.tabs(["MTProto Proxies", "VLESS Keys"])
+tab_mtproto, tab_vless, tab_sub = st.tabs(["MTProto Proxies", "VLESS Keys", "Своя подписка"])
 
 # ─── Вкладка MTProto ──────────────────────────────────────────────────────
 with tab_mtproto:
@@ -1367,8 +1675,13 @@ with tab_vless:
             value=True, key="vless_enable_xray",
         )
         if enable_xray:
+            st.caption(
+                f"Строгая проверка: ключ должен ответить минимум на {VALIDATION_MIN_SUCCESS} разных хоста "
+                f"и реально скачать блок данных (≥{VALIDATION_MIN_BYTES // 1024} КБ) — "
+                f"это отсеивает «отвечает, но не работает»."
+            )
             test_url = st.text_input(
-                "URL для теста (должен вернуть 200/204):",
+                "Основной URL для теста (должен вернуть 200/204):",
                 value=DEFAULT_TEST_URL, key="vless_test_url",
             )
             enable_speed = st.checkbox(
@@ -1555,7 +1868,7 @@ with tab_vless:
                     f"Готово! Рабочих: {len(found_keys)} из {total} проверенных."
                 )
             elif len(found_keys) < target:
-                status_text.warning(f"Найдено {len(found_keys)} из {target} запрошенных.")
+                status_text.warning(f"��айдено {len(found_keys)} из {target} запрошенных.")
             else:
                 status_text.success(f"Готово! Найдено {len(found_keys)} ключей.")
 
@@ -1683,7 +1996,7 @@ with tab_vless:
                                     rechecked.append({"info": info, "key": info["raw"], "ping": ping})
                     save_working_db([])
                     upsert_working_db(rechecked)
-                    st.success(f"Живых после перепроверки: {len(rechecked)}")
+                    st.success(f"Жив��х после перепроверки: {len(rechecked)}")
                     st.rerun()
         with db_col2:
             if st.button("Очистить рабочую базу", key="btn_clear_working", type="primary", use_container_width=True):
@@ -1905,3 +2218,156 @@ with tab_vless:
         st.warning("Не удалось загрузить VLESS ключи. Проверьте доступность источников.")
     else:
         st.info("Нажмите кнопку выше, чтобы загрузить VLESS ключи.")
+
+
+# ─── Вкладка «Своя подписка» ─────────────────────────────────
+with tab_sub:
+    st.subheader("Своя подписка из ваших ключей")
+    st.write(
+        "Загрузите свой `.txt` с ключами `vless://`, программа проверит их "
+        "полным каскадом (TCP → TLS → Xray) и соберёт рабочие в ссылку-подписку "
+        "для Happ, v2rayN, Hiddify, Streisand и др."
+    )
+
+    srv = start_sub_server(SUB_SERVER_PORT)
+    sub_base = None
+    if srv.get("ok"):
+        sub_host = SUB_HOST_OVERRIDE or get_lan_ip()
+        sub_base = f"http://{sub_host}:{srv['port']}"
+        st.caption(f"Сервер подписок запущен: {sub_base}")
+    else:
+        st.error(
+            "Не удалось запустить локальный сервер подписок "
+            f"(порт {SUB_SERVER_PORT}+). Ссылку создать не получится."
+        )
+
+    if not XRAY_BIN:
+        st.warning("Xray не найден — проверка пройдёт только по TCP+TLS (без финального этапа).")
+
+    up = st.file_uploader("Файл с ключами (.txt)", type=["txt"], key="sub_file")
+    pasted = st.text_area(
+        "...или вставьте ключи vless:// прямо сюда",
+        height=120, key="sub_paste", placeholder="vless://...\nvless://...",
+    )
+
+    vpn_name_input = st.text_input(
+        "Название VPN (войдёт в имя каждого ключа)",
+        value="MyVPN", key="sub_vpn_name",
+    )
+    sub_add_country = st.checkbox(
+        "Добавлять страну сервера в имя (geo-IP через ip-api.com)",
+        value=True, key="sub_add_country",
+    )
+    st.caption(
+        "Имя ключа будет вида: «Название | хост СТРАНА», например «MyVPN | example.com RU»."
+    )
+
+    cset1, cset2 = st.columns(2)
+    with cset1:
+        ttl_choice = st.selectbox(
+            "Срок жизни ссылки:",
+            ["Без ограничения", "1 час", "6 часов", "24 часа", "7 дней", "Своё (минуты)"],
+            key="sub_ttl_choice",
+        )
+    with cset2:
+        sub_enable_xray = st.checkbox(
+            "Финальная проверка через Xray", value=bool(XRAY_BIN),
+            key="sub_enable_xray", disabled=not XRAY_BIN,
+        )
+    ttl_map = {"1 час": 60, "6 часов": 360, "24 часа": 1440, "7 дней": 10080}
+    ttl_minutes = ttl_map.get(ttl_choice)
+    if ttl_choice == "Своё (минуты)":
+        ttl_minutes = int(st.number_input(
+            "Минут до отключения ссылки:", min_value=1, max_value=100000,
+            value=60, step=30, key="sub_ttl_custom",
+        ))
+
+    st.session_state.setdefault("sub_result", None)
+
+    if st.button("Проверить и создать подписку", use_container_width=True, key="btn_sub_run"):
+        raw_text = ""
+        if up is not None:
+            try:
+                raw_text += up.getvalue().decode("utf-8", errors="ignore") + "\n"
+            except Exception:
+                st.error("Не удалось прочитать файл.")
+        if pasted.strip():
+            raw_text += pasted
+        infos = parse_vless_text(raw_text)
+        if not infos:
+            st.error("Не найдено ни одного ключа vless:// в файле/тексте.")
+        elif not sub_base:
+            st.error("Сервер подписок не запущен — ссылку создать нельзя.")
+        else:
+            st.write(f"Загружено **{len(infos)}** уникальных ключей. Запускаю каскад...")
+            found = run_full_cascade(infos, enable_xray=sub_enable_xray)
+            if not found:
+                st.session_state.sub_result = None
+                st.error("Ни один ключ не прошёл проверку.")
+            else:
+                vpn_name = (vpn_name_input or "MyVPN").strip() or "MyVPN"
+                countries = {}
+                if sub_add_country:
+                    with st.spinner("Определяю страны серверов..."):
+                        countries = lookup_countries([f["info"]["host"] for f in found])
+                keys = []
+                for f in found:
+                    h = f["info"]["host"]
+                    cc = countries.get(h, "") if sub_add_country else ""
+                    label = (f"{vpn_name} | {h} {cc}").rstrip()
+                    keys.append(rename_vless_key(f["key"], label))
+                token, expires = create_subscription_entry(
+                    keys, ttl_minutes=ttl_minutes, name=f"My sub ({len(keys)})",
+                )
+                st.session_state.sub_result = {
+                    "token": token,
+                    "link": f"{sub_base}/sub/{token}",
+                    "count": len(keys),
+                    "expires": expires,
+                }
+                st.success(f"Готово! Рабочих ключей: {len(keys)}")
+
+    res = st.session_state.get("sub_result")
+    if res:
+        st.markdown("#### Ваша ссылка-подписка")
+        st.code(res["link"], language=None)
+        st.caption(
+            f"ключей: {res['count']} · срок: {fmt_remaining(res['expires'])}"
+        )
+        st.markdown(
+            f"<a class='tg-btn' href=\"{html.escape(res['link'], quote=True)}\">Открыть ссылку</a>",
+            unsafe_allow_html=True,
+        )
+        st.info(
+            "Вставьте ссылку в раздел «Подписки» вашего клиента (Happ, v2rayN, "
+            "Hiddify и т.д.). Ссылка работает, пока запущено это приложение и "
+            "устройство доступно по сети. Для мобильного интернета задайте "
+            "публичный адрес через переменную окружения PM_SUB_HOST."
+        )
+
+    st.markdown("---")
+    st.markdown("### Активные подписки")
+    subs = cleanup_subs(load_subs())
+    save_subs(subs)
+    if subs and sub_base:
+        for token, entry in sorted(subs.items(), key=lambda kv: kv[1].get("created", 0), reverse=True):
+            link = f"{sub_base}/sub/{token}"
+            left = fmt_remaining(entry.get("expires"))
+            sc1, sc2 = st.columns([5, 1])
+            with sc1:
+                st.markdown(
+                    f"<div class='pm-row'>"
+                    f"<span class='pm-name'>{html.escape(link)}<br>"
+                    f"<span style='color:var(--text-secondary);font-size:12px;'>"
+                    f"ключей: {entry.get('count', 0)} · осталось: {html.escape(left)}</span></span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            with sc2:
+                if st.button("Удалить", key=f"del_sub_{token}", use_container_width=True):
+                    delete_subscription(token)
+                    if res and res.get("token") == token:
+                        st.session_state.sub_result = None
+                    st.rerun()
+    else:
+        st.info("Активных подписок нет.")
