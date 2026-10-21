@@ -124,9 +124,10 @@ def main():
         XRAY_WORKERS, stop, limit=args.count,
     )
     if not found:
-        # Пустой результат не должен затирать уже опубликованный список.
-        print("[!] рабочих ключей не найдено, файл не изменён", file=sys.stderr)
-        sys.exit(1)
+        # Пустой результат не должен затирать уже опубликованный список,
+        # а временная недоступность источников не должна краснить CI.
+        print("[!] рабочих ключей не найдено, файл не изменён")
+        return
 
     found.sort(key=lambda item: (-item["score"], item["ping"]))
     with open(args.output, "w", encoding="utf-8") as fh:

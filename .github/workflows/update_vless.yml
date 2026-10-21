@@ -8,16 +8,16 @@ on:
 
 jobs:
   update-vless:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -110,6 +110,11 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git commit -m "chore: update vless.txt [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+          # filter-vless.yml пушит в main параллельно, поэтому push может быть отклонён.
+          for attempt in 1 2 3; do
+            git push && exit 0
+            git pull --rebase -X theirs origin main
+          done
           git push
 
       - name: Upload vless.txt to Yandex Disk

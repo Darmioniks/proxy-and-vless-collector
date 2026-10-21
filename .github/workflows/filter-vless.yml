@@ -17,14 +17,14 @@ concurrency:
 
 jobs:
   filter:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -74,5 +74,10 @@ jobs:
             echo "Изменений нет — коммит не нужен"
           else
             git commit -m "chore: обновление vless_filtered.txt [skip ci]"
+            # update_vless.yml пушит в main каждые 15 минут, поэтому push может быть отклонён.
+            for attempt in 1 2 3; do
+              git push && exit 0
+              git pull --rebase -X theirs origin main
+            done
             git push
           fi
