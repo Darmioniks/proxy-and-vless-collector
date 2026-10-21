@@ -28,6 +28,22 @@ class DesktopTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         startfile.assert_called_once_with(desktop.happ_link())
 
+    @unittest.skipUnless(hasattr(__import__("os"), "startfile"), "Windows only")
+    def test_open_happ_accepts_local_working_subscription(self):
+        url = "http://127.0.0.1:43125/sub/abc123"
+        with patch("desktop.happ_command", return_value='"Happ.exe" "%1"'), \
+                patch("desktop.os.startfile") as startfile:
+            result = desktop.DesktopApi().open_happ(url)
+
+        self.assertTrue(result["ok"])
+        startfile.assert_called_once_with(desktop.happ_link(url))
+
+    def test_open_happ_rejects_untrusted_subscription(self):
+        result = desktop.DesktopApi().open_happ("https://example.com/sub/abc")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("Некорректная", result["error"])
+
     def test_telegram_proxy_rejects_other_links(self):
         result = desktop.DesktopApi().open_telegram_proxy("https://example.com")
 
@@ -42,6 +58,16 @@ class DesktopTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         startfile.assert_called_once_with(link)
 
+
+    def test_port_stays_stable_between_launches(self):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp,                 patch.dict(os.environ, {"PM_SUB_PORT": ""}):
+            with patch("desktop.app_data_dir", return_value=tmp):
+                first = desktop.choose_port()
+                second = desktop.choose_port()
+        self.assertEqual(first, second)
+        self.assertGreater(first, 0)
 
 if __name__ == "__main__":
     unittest.main()

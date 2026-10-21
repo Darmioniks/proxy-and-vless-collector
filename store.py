@@ -63,6 +63,9 @@ def init_db():
         columns = {row["name"] for row in db.execute("PRAGMA table_info(working_keys)")}
         if "country" not in columns:
             db.execute("ALTER TABLE working_keys ADD COLUMN country TEXT NOT NULL DEFAULT ''")
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_working_checked ON working_keys(checked_at, score)"
+        )
 
 
 def preferred_keys():
@@ -94,13 +97,77 @@ def save_result(item):
         ))
 
 
-def list_working(limit=100):
+def list_working(limit=100, offset=0):
     with connect() as db:
         rows = db.execute(
-            "SELECT * FROM working_keys ORDER BY score DESC, checked_at DESC LIMIT ?",
-            (limit,),
+            "SELECT * FROM working_keys ORDER BY score DESC, checked_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def count_working():
+    with connect() as db:
+        return db.execute("SELECT COUNT(*) AS n FROM working_keys").fetchone()["n"]
+
+
+def working_keys():
+    with connect() as db:
+        rows = db.execute(
+            "SELECT raw FROM working_keys ORDER BY score DESC, checked_at DESC"
+        ).fetchall()
+    return [row["raw"] for row in rows]
+
+
+def saved_since(moment, keys):
+    """Keys from the set that were written at or after the snapshot moment.
+
+    A recheck must not delete a key another job verified in the meantime.
+    """
+    keys = list(dict.fromkeys(keys))
+    if not keys or not moment:
+        return set()
+    found = set()
+    with connect() as db:
+        for offset in range(0, len(keys), 500):
+            chunk = keys[offset:offset + 500]
+            marks = ",".join("?" for _ in chunk)
+            rows = db.execute(
+                "SELECT raw FROM working_keys WHERE checked_at >= ? AND raw IN (%s)" % marks,
+                [int(moment), *chunk],
+            ).fetchall()
+            found.update(row["raw"] for row in rows)
+    return found
+
+
+def purge_stale_working(max_age_days=None):
+    """Drop working keys older than the TTL. Returns the number removed."""
+    import checker
+    days = checker.WORKING_TTL_DAYS if max_age_days is None else max_age_days
+    cutoff = int(time.time()) - days * 86400
+    with connect() as db:
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_working_checked ON working_keys(checked_at)"
+        )
+        cursor = db.execute("DELETE FROM working_keys WHERE checked_at < ?", (cutoff,))
+        return cursor.rowcount
+
+
+def delete_working(keys):
+    keys = list(dict.fromkeys(keys))
+    if not keys:
+        return 0
+    removed = 0
+    with connect() as db:
+        for offset in range(0, len(keys), 500):
+            chunk = keys[offset:offset + 500]
+            marks = ",".join("?" for _ in chunk)
+            cursor = db.execute(
+                f"DELETE FROM working_keys WHERE raw IN ({marks})",
+                chunk,
+            )
+            removed += cursor.rowcount
+    return removed
 
 
 def save_source_counts(counts):

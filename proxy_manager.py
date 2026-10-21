@@ -702,7 +702,7 @@ def start_sub_server(preferred_port):
     last_err = None
     for p in range(preferred_port, preferred_port + 10):
         try:
-            server = ThreadingHTTPServer(("0.0.0.0", p), _SubHandler)
+            server = ThreadingHTTPServer((os.environ.get("PM_SUB_HOST", "127.0.0.1"), p), _SubHandler)
             server.daemon_threads = True
             server.allow_reuse_address = True
             threading.Thread(target=server.serve_forever, daemon=True).start()
