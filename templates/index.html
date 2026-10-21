@@ -167,9 +167,22 @@
 
         <section id="working-view" class="view">
             <header class="page-header compact">
-                <div><h1>Рабочая база</h1><p>Ключи, которые фактически прошли проверку.</p></div>
-                <button id="refresh-working" class="secondary-button" type="button">Обновить</button>
+                <div><h1>Рабочая база</h1><p>Повторная проверка, экспорт и подключение сохранённых ключей.</p></div>
             </header>
+            <section class="working-toolbar panel">
+                <div class="working-summary">
+                    <strong id="working-count">0 ключей</strong>
+                    <span id="working-status">База ещё не загружена.</span>
+                </div>
+                <div class="working-actions">
+                    <button id="recheck-working" class="primary-button" type="button">Перепроверить</button>
+                    <button id="working-happ" class="secondary-button" type="button">Добавить в Happ</button>
+                    <button id="copy-working" class="secondary-button" type="button">Скопировать</button>
+                    <a id="download-working" class="secondary-button" href="/api/working/download">Скачать TXT</a>
+                    <button id="refresh-working" class="secondary-button" type="button">Обновить список</button>
+                </div>
+                <div id="working-progress" class="working-progress hidden"><i></i></div>
+            </section>
             <div id="working-list" class="working-list"></div>
         </section>
 

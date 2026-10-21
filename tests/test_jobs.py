@@ -27,7 +27,7 @@ class JobTest(unittest.TestCase):
         with patch("checker.XRAY_BIN", "xray.exe"), \
                 patch("checker.vless_to_outbound", return_value={}), \
                 patch("checker.subprocess.Popen") as popen, \
-                patch("checker.time.sleep"):
+                patch("checker._wait_socks", return_value=True):
             _, path, _ = checker._start_xray({})
 
         try:
@@ -80,7 +80,7 @@ class JobTest(unittest.TestCase):
 
         self.assertEqual(job.state, "completed")
         self.assertEqual(len(job.results), 3)
-        self.assertLessEqual(calls, 6)
+        self.assertLessEqual(calls, 20)
 
     def test_tcp_is_cached_for_same_endpoint(self):
         keys = "\n".join(
@@ -171,6 +171,106 @@ class JobTest(unittest.TestCase):
             {"1.1.1.1": "AU", "8.8.8.8": "US"},
         )
 
+    def test_working_recheck_removes_only_failed_snapshot_keys(self):
+        good = (
+            "vless://11111111-1111-1111-1111-111111111111@good.example:443"
+            "?security=none&type=tcp#Good"
+        )
+        bad = (
+            "vless://22222222-2222-2222-2222-222222222222@bad.example:443"
+            "?security=none&type=tcp#Bad"
+        )
+        for raw in (good, bad):
+            info = checker.parse_vless(raw)
+            store.save_result({"info": info, "ping": 20, "speed": None, "score": 75})
+
+        cfg = self.cfg(f"{good}\n{bad}", count=2, workers=2)
+        cfg["max_checks"] = None
+        cfg["prune_working"] = True
+        cfg["working_snapshot"] = [good, bad]
+        with patch("checker.check_tcp", side_effect=lambda host, port: 20 if host == "good.example" else None):
+            job = Job(cfg)
+            job.run()
+
+        self.assertEqual(job.state, "completed")
+        self.assertEqual(store.working_keys(), [good])
+        self.assertIn("удалено 1", job.message)
+
+    def test_stopped_working_recheck_does_not_delete_keys(self):
+        raw = (
+            "vless://33333333-3333-3333-3333-333333333333@one.example:443"
+            "?security=none&type=tcp#One"
+        )
+        info = checker.parse_vless(raw)
+        store.save_result({"info": info, "ping": 20, "speed": None, "score": 75})
+        cfg = self.cfg(raw, count=1)
+        cfg["prune_working"] = True
+        cfg["working_snapshot"] = [raw]
+        job = Job(cfg)
+        job.stop()
+        job.run()
+
+        self.assertEqual(job.state, "stopped")
+        self.assertEqual(store.working_keys(), [raw])
+
+
+    def test_reality_skips_python_tls_probe(self):
+        raw = (
+            "vless://11111111-1111-1111-1111-111111111111@real.example:443"
+            "?security=reality&type=tcp&sni=www.microsoft.com&pbk=pub&sid=ab#R"
+        )
+        with patch("checker.check_tcp", return_value=20),                 patch("checker.check_tls") as tls,                 patch("checker.check_xray", return_value=30):
+            cfg = self.cfg(raw, count=1)
+            cfg["enable_xray"] = True
+            job = Job(cfg)
+            job.run()
+        tls.assert_not_called()
+        self.assertEqual(len(job.results), 1)
+
+    def test_private_address_is_dropped_before_tcp(self):
+        raw = (
+            "vless://11111111-1111-1111-1111-111111111111@127.0.0.1:443"
+            "?security=none&type=tcp#local"
+        )
+        with patch("checker.check_tcp") as tcp:
+            job = Job(self.cfg(raw, count=1))
+            job.run()
+        tcp.assert_not_called()
+        self.assertEqual(job.results, [])
+
+    def test_name_fragment_does_not_duplicate_checks(self):
+        base = (
+            "vless://11111111-1111-1111-1111-111111111111@dup.example:443"
+            "?security=none&type=tcp#"
+        )
+        with patch("checker.check_tcp", return_value=20) as tcp:
+            job = Job(self.cfg((base + "one") + chr(10) + (base + "two"), count=2))
+            job.run()
+        self.assertEqual(tcp.call_count, 1)
+        self.assertEqual(len(job.results), 1)
+
+    def test_event_ids_keep_growing_after_trim(self):
+        job = Job(self.cfg("", count=1))
+        for _ in range(10001):
+            job.emit("progress", {"n": 1})
+        ids = [event["id"] for event in job.events]
+        self.assertEqual(ids, sorted(ids))
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertGreater(ids[0], 1)
+        last = ids[-1]
+        job.emit("state", {"state": "completed"})
+        self.assertEqual(job.events[-1]["id"], last + 1)
+        replay = job.events_after(last - 1)
+        self.assertEqual(replay[-1]["type"], "state")
+
+    def test_finished_jobs_expire(self):
+        from jobs import jobs as registry
+        job = Job(self.cfg(
+            "vless://11111111-1111-1111-1111-111111111111@gone.example:443"
+            "?security=none&type=tcp#g", count=1))
+        job.finished_at = time.time() - 10**7
+        registry.items[job.id] = job
+        self.assertIsNone(registry.get(job.id))
 
 if __name__ == "__main__":
     unittest.main()

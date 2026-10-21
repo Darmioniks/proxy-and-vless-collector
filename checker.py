@@ -1,6 +1,8 @@
+import ipaddress
 import json
 import os
 import random
+import re
 import shutil
 import socket
 import ssl
@@ -15,6 +17,20 @@ import requests
 
 
 HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (ProxyManager/2.0)"}
+
+# Глобальный предел одновременно запущенных процессов Xray для всех заданий.
+XRAY_CONCURRENCY = int(os.environ.get("PM_XRAY_CONCURRENCY", "8"))
+XRAY_SLOTS = threading.BoundedSemaphore(XRAY_CONCURRENCY)
+XRAY_START_TIMEOUT = 5.0
+# Сколько держать проверенные ключи в рабочей базе.
+WORKING_TTL_DAYS = int(os.environ.get("PM_WORKING_TTL_DAYS", "30"))
+
+SUPPORTED_NETWORKS = {"tcp", "ws", "grpc", "xhttp", "httpupgrade", "raw", "kcp"}
+UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+# xhttp mode -> Xray xHTTP mode. Неизвестные значения игнорируются.
+XHTTP_MODES = {"auto", "packet-up", "stream-up", "stream-one"}
 DEFAULT_TEST_URL = "https://www.gstatic.com/generate_204"
 DEFAULT_SPEED_URL = "https://speed.cloudflare.com/__down?bytes=1000000"
 VALIDATION_URLS = [
@@ -71,25 +87,97 @@ def parse_vless(raw):
         if "@" not in body:
             return None
         uuid, host_part = body.split("@", 1)
-        if host_part.startswith("["):
-            end = host_part.find("]")
-            if end == -1:
-                return None
-            host = host_part[1:end]
-            rest = host_part[end + 1:]
-            port = rest[1:] if rest.startswith(":") else ""
-        elif ":" in host_part:
-            host, port = host_part.rsplit(":", 1)
-        else:
+        host, port = split_host_port(host_part)
+        if not host or port is None:
             return None
-        if not uuid or not host or not port.isdigit():
+        params = normalize_params(params)
+        network = params.get("type", "tcp")
+        if network not in SUPPORTED_NETWORKS:
+            return None
+        security = params.get("security", "none")
+        if security not in ("none", "tls", "reality"):
+            return None
+        if not UUID_RE.match(uuid):
+            return None
+        if security == "reality" and not (params.get("pbk") and params.get("sni")):
             return None
         return {
-            "raw": raw, "uuid": uuid, "host": host, "port": int(port),
+            "raw": raw, "uuid": uuid, "host": host, "port": port,
             "name": name, "params": params,
         }
     except Exception:
         return None
+
+
+def split_host_port(host_part):
+    """Разделяет host:port, включая IPv6 в скобках и голый IPv6 без порта."""
+    host_part = host_part.strip()
+    if not host_part or any(ch in host_part for ch in (' ', '<', '>', '"', "'", '/', '\\')):
+        return None, None
+    if host_part.startswith("["):
+        end = host_part.find("]")
+        if end == -1:
+            return None, None
+        host = host_part[1:end]
+        rest = host_part[end + 1:]
+        if rest.startswith(":"):
+            port = rest[1:]
+        elif not rest:
+            port = "443"
+        else:
+            return None, None
+    elif host_part.count(":") > 1:
+        host, port = host_part, "443"
+    elif ":" in host_part:
+        host, port = host_part.rsplit(":", 1)
+    else:
+        host, port = host_part, "443"
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        return None, None
+    host = host.strip().rstrip(".").lower()
+    if not host or len(host) > 253:
+        return None, None
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return None, None
+    return host, int(port)
+
+
+def normalize_params(params):
+    """Снимает HTML-экранирование amp; и приводит известные ключи."""
+    out = {}
+    for key, value in params.items():
+        key = key.replace("amp;", "").strip()
+        if not key or key in out:
+            continue
+        out[key] = value.strip()
+    if "allowInsecure" not in out and "allowinsecure" in out:
+        out["allowInsecure"] = out["allowinsecure"]
+    if "allowInsecure" not in out and "insecure" in out:
+        out["allowInsecure"] = out["insecure"]
+    return out
+
+
+def is_private_host(host):
+    """True для loopback, частных, link-local и иных неглобальных адресов."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host in ("localhost", "localhost.localdomain") or host.endswith(".local")
+    return (
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+    )
+
+
+def key_identity(info):
+    """Идентичность ключа без фрагмента #name: одинаковые параметры = один ключ."""
+    params = info["params"]
+    items = tuple(sorted(
+        (k, v) for k, v in params.items() if k not in ("note", "name")
+    ))
+    return (info["uuid"], info["host"], info["port"], items)
 
 
 def parse_text(text):
@@ -173,6 +261,15 @@ def resolve_hosts(hosts, report=None, stop_event=None):
     return resolved
 
 
+def _header_int(response, name, default):
+    """Число из заголовка ip-api. Некорректное значение не роняет задание."""
+    raw = (response.headers.get(name) or "").strip()
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 def lookup_ip_countries(ips, cached=None, save=None, report=None, stop_event=None):
     countries = dict(cached or {})
     missing = [ip for ip in dict.fromkeys(ips) if ip not in countries]
@@ -183,6 +280,7 @@ def lookup_ip_countries(ips, cached=None, save=None, report=None, stop_event=Non
             break
         chunk = missing[offset:offset + 100]
         response = None
+        limited = False
         for _ in range(3):
             try:
                 response = requests.post(
@@ -190,31 +288,39 @@ def lookup_ip_countries(ips, cached=None, save=None, report=None, stop_event=Non
                     json=chunk, timeout=20, headers=HTTP_HEADERS,
                 )
             except Exception:
+                # Сетевая ошибка: страны неизвестны, задание продолжается.
                 response = None
                 break
             if response.status_code != 429:
                 break
-            wait_for = max(1, int(response.headers.get("X-Ttl", "60") or 60) + 1)
-            if stop_event and stop_event.wait(wait_for):
-                return countries
-            time.sleep(wait_for) if not stop_event else None
+            limited = True
+            wait_for = max(1, _header_int(response, "X-Ttl", 60) + 1)
+            if stop_event:
+                if stop_event.wait(wait_for):
+                    return countries
+            else:
+                time.sleep(wait_for)
         fresh = {}
         if response is not None and response.status_code == 200:
             try:
-                for row in response.json():
+                rows = response.json()
+            except Exception:
+                rows = []
+            if isinstance(rows, list):
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
                     if row.get("status") == "success" and row.get("query"):
                         fresh[row["query"]] = (row.get("countryCode") or "").upper()
-            except Exception:
-                fresh = {}
         countries.update(fresh)
         if save and fresh:
             save(fresh)
         done += len(chunk)
         if report:
             report("geo", done, total, len(fresh))
-        remaining = int(response.headers.get("X-Rl", "1") or 1) if response is not None else 1
-        if remaining == 0 and done < total:
-            wait_for = max(1, int(response.headers.get("X-Ttl", "60") or 60) + 1)
+        remaining = _header_int(response, "X-Rl", 1) if response is not None else 1
+        if (limited or remaining <= 0) and done < total and response is not None:
+            wait_for = max(1, _header_int(response, "X-Ttl", 60) + 1)
             if stop_event:
                 if stop_event.wait(wait_for):
                     break
@@ -246,9 +352,29 @@ def check_tls(host, port, sni, timeout=3.0):
         return None
 
 
+def _percent_path(value, default="/"):
+    """path/spiderX from URI is percent-encoded, Xray wants plain text."""
+    text = urllib.parse.unquote(value or "").strip() or default
+    return text if text.startswith("/") else "/" + text
+
+
+def _xhttp_extra(raw):
+    text = urllib.parse.unquote(raw or "").strip()
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def vless_to_outbound(info):
+    """xhttp and httpupgrade handled below"""
     p = info["params"]
     network = p.get("type", "tcp")
+    if network == "raw":
+        network = "tcp"
     security = p.get("security", "none")
     user = {"id": info["uuid"], "encryption": p.get("encryption", "none")}
     if p.get("flow"):
@@ -266,11 +392,11 @@ def vless_to_outbound(info):
         stream["realitySettings"] = {
             "serverName": p.get("sni", ""), "fingerprint": p.get("fp", "chrome"),
             "publicKey": p.get("pbk", ""), "shortId": p.get("sid", ""),
-            "spiderX": p.get("spx", "/"),
+            "spiderX": _percent_path(p.get("spx"), "/"),
         }
     if network == "ws":
         stream["wsSettings"] = {
-            "path": p.get("path", "/"),
+            "path": _percent_path(p.get("path"), "/"),
             "headers": {"Host": p.get("host", info["host"])},
         }
     elif network == "grpc":
@@ -281,6 +407,26 @@ def vless_to_outbound(info):
                 "headers": {"Host": [p.get("host", info["host"])]}
             }}
         }
+    elif network == "xhttp":
+        settings = {
+            "path": _percent_path(p.get("path"), "/"),
+            "host": p.get("host", ""),
+        }
+        mode = p.get("mode", "")
+        if mode in XHTTP_MODES:
+            settings["mode"] = mode
+        extra = _xhttp_extra(p.get("extra"))
+        for key in ("xPaddingBytes", "scMaxEachPostBytes", "noGRPCHeader"):
+            if key in extra:
+                settings[key] = extra[key]
+        stream["xhttpSettings"] = settings
+    elif network == "httpupgrade":
+        stream["httpupgradeSettings"] = {
+            "path": _percent_path(p.get("path"), "/"),
+            "host": p.get("host", info["host"]),
+        }
+    elif network == "kcp":
+        stream["kcpSettings"] = {"header": {"type": p.get("headerType", "none")}}
     return {
         "protocol": "vless",
         "settings": {"vnext": [{
@@ -290,13 +436,36 @@ def vless_to_outbound(info):
     }
 
 
+
+def _port_open(port):
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
+def _wait_socks(port, proc, stop_event=None, timeout=XRAY_START_TIMEOUT):
+    """Wait until the local SOCKS port accepts. False on death, timeout or cancel."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            return False
+        if proc.poll() is not None:
+            return False
+        if _port_open(port):
+            return True
+        time.sleep(0.05)
+    return proc.poll() is None and _port_open(port)
+
+
 def _free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
 
 
-def _start_xray(info):
+def _start_xray(info, stop_event=None):
     port = _free_port()
     cfg = {
         "log": {"loglevel": "none"},
@@ -319,15 +488,15 @@ def _start_xray(info):
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         **popen_args,
     )
-    time.sleep(0.8)
-    return proc, fh.name, {
-        "http": f"socks5h://127.0.0.1:{port}",
-        "https": f"socks5h://127.0.0.1:{port}",
-    }
+    if not _wait_socks(port, proc, stop_event):
+        _stop_xray(proc, fh.name)
+        raise RuntimeError("xray failed to start")
+    proxy = "socks5h://127.0.0.1:%d" % port
+    return proc, fh.name, {"http": proxy, "https": proxy}
 
 
 def _stop_xray(proc, path):
-    if proc is not None:
+    if proc is not None and proc.poll() is None:
         proc.terminate()
         try:
             proc.wait(timeout=3)
@@ -340,13 +509,52 @@ def _stop_xray(proc, path):
             pass
 
 
-def check_xray(info, test_url=DEFAULT_TEST_URL, timeout=8):
-    if not XRAY_BIN:
+def _acquire_xray_slot(stop_event, timeout):
+    """Take one global Xray process slot, honouring cancellation."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            return False
+        if XRAY_SLOTS.acquire(timeout=0.2):
+            return True
+    return False
+
+
+def _download_bytes(url, proxies, timeout, stop_event, min_bytes):
+    """Stream up to min_bytes and always close the response."""
+    resp = None
+    try:
+        start = time.time()
+        resp = requests.get(
+            url, proxies=proxies, timeout=timeout, headers=HTTP_HEADERS, stream=True,
+        )
+        if resp.status_code not in (200, 204):
+            return False
+        size = 0
+        for chunk in resp.iter_content(chunk_size=65536):
+            if stop_event is not None and stop_event.is_set():
+                return False
+            if chunk:
+                size += len(chunk)
+            if size >= min_bytes or time.time() - start > timeout:
+                break
+        return size >= min_bytes
+    except Exception:
+        return False
+    finally:
+        if resp is not None:
+            resp.close()
+
+
+def check_xray(info, test_url=DEFAULT_TEST_URL, timeout=8, stop_event=None,
+               download_url=VALIDATION_DOWNLOAD_URL, min_success=VALIDATION_MIN_SUCCESS,
+               min_bytes=VALIDATION_MIN_BYTES):
+    if not XRAY_BIN or not _acquire_xray_slot(stop_event, timeout):
         return None
     proc = None
     path = None
     try:
-        proc, path, proxies = _start_xray(info)
+        proc, path, proxies = _start_xray(info, stop_event)
         urls = []
         for url in [test_url] + VALIDATION_URLS:
             if url and url not in urls:
@@ -354,59 +562,83 @@ def check_xray(info, test_url=DEFAULT_TEST_URL, timeout=8):
         successes = 0
         best_ping = None
         for url in urls:
+            if stop_event is not None and stop_event.is_set():
+                return None
+            resp = None
             try:
                 start = time.time()
-                resp = requests.get(url, proxies=proxies, timeout=timeout, headers=HTTP_HEADERS)
+                resp = requests.get(
+                    url, proxies=proxies, timeout=timeout, headers=HTTP_HEADERS,
+                )
                 if resp.status_code in (200, 204):
                     successes += 1
                     ping = int((time.time() - start) * 1000)
                     best_ping = ping if best_ping is None else min(best_ping, ping)
-                    if successes >= VALIDATION_MIN_SUCCESS:
+                    if successes >= min_success:
                         break
             except Exception:
                 continue
-        if successes < VALIDATION_MIN_SUCCESS:
+            finally:
+                if resp is not None:
+                    resp.close()
+        if successes < min_success:
             return None
-        start = time.time()
-        resp = requests.get(
-            VALIDATION_DOWNLOAD_URL, proxies=proxies, timeout=timeout,
-            headers=HTTP_HEADERS, stream=True,
-        )
-        if resp.status_code not in (200, 204):
-            return None
-        size = 0
-        for chunk in resp.iter_content(chunk_size=65536):
-            if chunk:
-                size += len(chunk)
-            if size >= VALIDATION_MIN_BYTES or time.time() - start > timeout:
-                break
-        return best_ping if size >= VALIDATION_MIN_BYTES else None
+        if not download_url or min_bytes <= 0:
+            return best_ping
+        return best_ping if _download_bytes(
+            download_url, proxies, timeout, stop_event, min_bytes,
+        ) else None
     except Exception:
         return None
     finally:
         _stop_xray(proc, path)
+        XRAY_SLOTS.release()
 
 
-def check_speed(info, url=DEFAULT_SPEED_URL, timeout=12):
-    if not XRAY_BIN:
+def check_speed(info, urls=None, timeout=12, stop_event=None):
+    """Measure speed. One answering URL is enough."""
+    if isinstance(urls, str):
+        urls = [urls]
+    urls = [url for url in (urls or [DEFAULT_SPEED_URL]) if url]
+    if not XRAY_BIN or not urls or not _acquire_xray_slot(stop_event, timeout):
         return None
     proc = None
     path = None
     try:
-        proc, path, proxies = _start_xray(info)
-        start = time.time()
-        resp = requests.get(
-            url, proxies=proxies, timeout=timeout, headers=HTTP_HEADERS, stream=True,
-        )
-        if resp.status_code not in (200, 204):
-            return None
-        size = sum(len(chunk) for chunk in resp.iter_content(65536) if chunk)
-        elapsed = max(time.time() - start, 0.001)
-        return round(size * 8 / elapsed / 1_000_000, 2) if size else None
+        proc, path, proxies = _start_xray(info, stop_event)
+        for url in urls:
+            if stop_event is not None and stop_event.is_set():
+                return None
+            resp = None
+            try:
+                start = time.time()
+                resp = requests.get(
+                    url, proxies=proxies, timeout=timeout,
+                    headers=HTTP_HEADERS, stream=True,
+                )
+                if resp.status_code not in (200, 204):
+                    continue
+                size = 0
+                for chunk in resp.iter_content(65536):
+                    if stop_event is not None and stop_event.is_set():
+                        return None
+                    if chunk:
+                        size += len(chunk)
+                elapsed = max(time.time() - start, 0.001)
+                if size:
+                    return round(size * 8 / elapsed / 1_000_000, 2)
+            except Exception:
+                continue
+            finally:
+                if resp is not None:
+                    resp.close()
+        return None
     except Exception:
         return None
     finally:
         _stop_xray(proc, path)
+        XRAY_SLOTS.release()
+
 
 
 class CheckCache:

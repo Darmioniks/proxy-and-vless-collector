@@ -49,6 +49,22 @@ jobs:
             --output vless_filtered.txt \
             --count 100
 
+      - name: Deduplicate and validate like the app
+        run: |
+          python - <<'EOF'
+          import checker
+          infos = checker.parse_text(open("vless_filtered.txt", encoding="utf-8").read())
+          seen = {}
+          for info in infos:
+              if checker.is_private_host(info["host"]):
+                  continue
+              seen.setdefault(checker.key_identity(info), info)
+          with open("vless_filtered.txt", "w", encoding="utf-8") as fh:
+              for info in seen.values():
+                  fh.write(info["raw"] + "\n")
+          print("after app rules: %d" % len(seen))
+          EOF
+
       - name: Commit & push if changed
         run: |
           git config user.name "github-actions[bot]"

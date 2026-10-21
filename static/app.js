@@ -4,6 +4,8 @@ const $$ = (selector) => [...document.querySelectorAll(selector)];
 let activeJob = null;
 let stream = null;
 let results = [];
+let workingItems = [];
+let workingStream = null;
 const selectedCountries = new Set();
 const excludedCountries = new Set();
 const countryCodes = 'AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW XK'.split(' ');
@@ -355,13 +357,34 @@ $('#subscription-button').addEventListener('click', async () => {
     box.classList.remove('hidden');
 });
 
-async function loadWorking() {
+function keyWord(count) {
+    const mod100 = count % 100;
+    const mod10 = count % 10;
+    if (mod100 >= 11 && mod100 <= 14) return 'ключей';
+    if (mod10 === 1) return 'ключ';
+    if (mod10 >= 2 && mod10 <= 4) return 'ключа';
+    return 'ключей';
+}
+
+async function loadWorking(message = '') {
     const list = $('#working-list');
+    const status = $('#working-status');
     list.classList.remove('empty');
     list.textContent = 'Загрузка…';
-    const response = await fetch('/api/working?limit=200');
-    const items = await response.json();
+    const response = await fetch('/api/working?limit=1000&offset=0');
+    const page = await response.json();
+    const items = Array.isArray(page) ? page : page.items;
+    const total = Array.isArray(page) ? items.length : page.total;
+    workingItems = items;
     list.replaceChildren();
+    $('#working-count').textContent = `${total} ${keyWord(total)}`;
+    if (!workingStream) status.textContent = message || (total
+        ? `Показаны ${items.length} из ${total} сохранённых ключей.`
+        : 'Рабочая база пуста.');
+    ['#recheck-working', '#working-happ', '#copy-working'].forEach(selector => {
+        $(selector).disabled = !items.length;
+    });
+    $('#download-working').classList.toggle('disabled', !items.length);
     if (!items.length) {
         list.classList.add('empty');
         list.innerHTML = '<div class="empty-state working-empty"><span class="empty-face">:\'(</span><strong>База пока пуста</strong><p>Успешные проверки сохраняются автоматически.</p></div>';
@@ -381,6 +404,107 @@ async function loadWorking() {
     });
 }
 $('#refresh-working').addEventListener('click', loadWorking);
+
+async function workingText() {
+    const response = await fetch('/api/working/download');
+    if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.detail || 'Не удалось получить рабочую базу');
+    }
+    return response.text();
+}
+
+$('#copy-working').addEventListener('click', async () => {
+    const button = $('#copy-working');
+    const status = $('#working-status');
+    try {
+        const copied = await copySubscription(await workingText());
+        if (!copied) throw new Error('Буфер обмена недоступен');
+        button.textContent = 'Скопировано';
+        status.textContent = `Скопировано ключей: ${workingItems.length}.`;
+        setTimeout(() => button.textContent = 'Скопировать', 1400);
+    } catch (error) {
+        status.textContent = error.message;
+    }
+});
+
+$('#working-happ').addEventListener('click', async () => {
+    const button = $('#working-happ');
+    const status = $('#working-status');
+    button.disabled = true;
+    status.textContent = 'Создаю локальную подписку…';
+    try {
+        const response = await fetch('/api/working/subscriptions', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name: 'Рабочая база Proxy Manager', ttl_minutes: null}),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Не удалось создать подписку');
+        if (window.PM_DESKTOP && window.pywebview?.api) {
+            const result = await window.pywebview.api.open_happ(data.url);
+            if (!result.ok) {
+                const copied = await copySubscription(data.url);
+                throw new Error(copied ? result.error : `${result.error} Ссылка: ${data.url}`);
+            }
+        } else {
+            window.location.href = `happ://add/${data.url}`;
+        }
+        status.textContent = `В Happ передано ключей: ${data.count}. Подтвердите добавление подписки.`;
+    } catch (error) {
+        status.textContent = error.message;
+    } finally {
+        button.disabled = !workingItems.length;
+    }
+});
+
+$('#recheck-working').addEventListener('click', async () => {
+    const button = $('#recheck-working');
+    const status = $('#working-status');
+    const progress = $('#working-progress');
+    button.disabled = true;
+    status.textContent = 'Запускаю перепроверку рабочей базы…';
+    progress.classList.remove('hidden');
+    progress.style.setProperty('--progress', '0%');
+    try {
+        const response = await fetch('/api/working/recheck', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({workers: 8, enable_xray: Boolean(window.PM_XRAY)}),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Не удалось запустить перепроверку');
+        if (workingStream) workingStream.close();
+        workingStream = new EventSource(`/api/jobs/${data.id}/events`);
+        workingStream.addEventListener('progress', event => {
+            const state = JSON.parse(event.data);
+            const percent = state.total ? Math.min(state.checked / state.total, 1) * 100 : 0;
+            progress.style.setProperty('--progress', `${percent}%`);
+            status.textContent = `Проверено ${state.checked} из ${state.total}; рабочих: ${state.counters.found || 0}.`;
+        });
+        workingStream.addEventListener('state', event => {
+            const state = JSON.parse(event.data);
+            status.textContent = state.message;
+            if (['completed', 'failed', 'stopped'].includes(state.state)) {
+                workingStream.close();
+                workingStream = null;
+                progress.style.setProperty('--progress', state.state === 'completed' ? '100%' : '0%');
+                setTimeout(() => progress.classList.add('hidden'), 900);
+                loadWorking(state.message);
+            }
+        });
+        workingStream.onerror = () => {
+            status.textContent = 'Соединение с перепроверкой прервано. Обновите список.';
+            workingStream?.close();
+            workingStream = null;
+            button.disabled = !workingItems.length;
+        };
+    } catch (error) {
+        status.textContent = error.message;
+        progress.classList.add('hidden');
+        button.disabled = !workingItems.length;
+    }
+});
 
 async function openTelegramProxy(link, button) {
     if (window.PM_DESKTOP && window.pywebview?.api) {

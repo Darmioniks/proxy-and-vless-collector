@@ -3,6 +3,11 @@ import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 
+# Cheap TCP/DNS probes and heavy Xray checks use separate pools.
+PREFILTER_WORKERS = 64
+# Finished jobs stay readable this long, then their results are dropped.
+JOB_TTL_SECONDS = 3600
+
 import checker
 import store
 
@@ -38,7 +43,9 @@ class Job:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.events = []
+        self.next_event_id = 1
         self.results = []
+        self.finished_at = None
         self.total = 0
         self.checked = 0
         self.counters = {
@@ -52,12 +59,13 @@ class Job:
     def emit(self, kind, data=None):
         with self.lock:
             event = {
-                "id": len(self.events) + 1,
+                "id": self.next_event_id,
                 "type": kind,
                 "data": data or {},
                 "ts": time.time(),
             }
             self.events.append(event)
+            self.next_event_id += 1
             if len(self.events) > 10000:
                 self.events = self.events[-8000:]
             return event
@@ -104,33 +112,57 @@ class Job:
         store.save_source_counts(counts)
         return infos
 
-    def _check_one(self, info):
+    def _probe(self, info):
+        """Cheap stage: private-address filter, DNS/TCP, then TLS for security=tls only.
+
+        Reality is never probed with a plain TLS handshake: it would fail and
+        throw away working keys. Xray checks it with its own key parameters.
+        """
         if self.stop_event.is_set():
             return "stopped", None
         host = info["host"]
         port = info["port"]
+        if checker.is_private_host(host):
+            return "tcp_failed", None
         tcp_key = (host, port)
-        tcp = self.tcp_cache.get(tcp_key, lambda: checker.check_tcp(host, port))
+        tcp = self.tcp_cache.get(
+            tcp_key, lambda: checker.check_tcp(host, port) if not self.stop_event.is_set() else None,
+        )
         if tcp is None:
             return "tcp_failed", None
         p = info["params"]
-        security = p.get("security", "none")
-        if security in ("tls", "reality"):
+        if p.get("security", "none") == "tls":
             sni = p.get("sni") or p.get("host") or host
             tls_key = (host, port, sni)
-            tls = self.tls_cache.get(tls_key, lambda: checker.check_tls(host, port, sni))
+            tls = self.tls_cache.get(
+                tls_key,
+                lambda: checker.check_tls(host, port, sni) if not self.stop_event.is_set() else None,
+            )
             if tls is None:
                 return "tls_failed", None
+        return "ready", (info, tcp)
+
+    def _check_one(self, info):
+        stage, tcp = self._probe(info)
+        if stage != "ready":
+            return stage, None
         if self.stop_event.is_set():
             return "stopped", None
         ping = tcp
         if self.cfg["enable_xray"]:
-            ping = checker.check_xray(info, self.cfg["test_url"])
+            ping = checker.check_xray(info, self.cfg["test_url"], stop_event=self.stop_event)
             if ping is None:
-                return "xray_failed", None
+                return "stopped" if self.stop_event.is_set() else "xray_failed", None
         item = {"info": info, "ping": ping, "speed": None}
         item["score"] = checker.score(info, ping)
         return "found", item
+
+    def _dedupe(self, infos):
+        """One key per uuid/host/port/params. The #name fragment is display only."""
+        seen = {}
+        for info in infos:
+            seen.setdefault(checker.key_identity(info), info)
+        return list(seen.values())
 
     def _filter_countries(self, infos):
         selected = set(self.cfg["filters"].get("countries") or [])
@@ -179,11 +211,83 @@ class Job:
         })
         return out
 
+    def _run_pool(self, infos, fn, workers):
+        """Run fn over infos, stopping as soon as the target count is reached.
+
+        The executor is not waited on after a stop: futures are cancelled and
+        the Xray processes they own see stop_event and exit on their own.
+        """
+        iterator = iter(infos)
+        pending = set()
+        survivors = []
+        executor = ThreadPoolExecutor(max_workers=max(1, workers))
+        try:
+            for _ in range(min(workers, len(infos))):
+                pending.add(executor.submit(fn, next(iterator)))
+            while pending and not self.stop_event.is_set():
+                done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    stage, item = fut.result()
+                    if stage == "ready":
+                        survivors.append(item)
+                        continue
+                    with self.lock:
+                        self.checked += 1
+                        if stage != "found" and stage in self.counters:
+                            self.counters[stage] += 1
+                    if stage == "found" and item is not None:
+                        accept = False
+                        with self.lock:
+                            if len(self.results) < self.cfg["count"]:
+                                self.results.append(item)
+                                self.counters["found"] += 1
+                                accept = True
+                        if accept:
+                            store.save_result(item)
+                            self.emit("key_found", public_result(item))
+                    self.emit("progress", self._progress())
+                if len(self.results) >= self.cfg["count"]:
+                    break
+                for _ in range(len(done)):
+                    try:
+                        pending.add(executor.submit(fn, next(iterator)))
+                    except StopIteration:
+                        break
+            for fut in pending:
+                fut.cancel()
+        finally:
+            executor.shutdown(wait=not self.stop_event.is_set(), cancel_futures=True)
+        return survivors
+
+    def _finish(self, payload):
+        """Heavy stage: Xray url test for a key that already passed the probe."""
+        info, tcp = payload
+        if self.stop_event.is_set():
+            return "stopped", None
+        ping = tcp
+        if self.cfg["enable_xray"]:
+            ping = checker.check_xray(info, self.cfg["test_url"], stop_event=self.stop_event)
+            if ping is None:
+                return "stopped" if self.stop_event.is_set() else "xray_failed", None
+        item = {"info": info, "ping": ping, "speed": None}
+        item["score"] = checker.score(info, ping)
+        return "found", item
+
+    def _progress(self):
+        """Counters only. The full result list stays on GET /api/jobs/{id}."""
+        with self.lock:
+            return {
+                "state": self.state,
+                "checked": self.checked,
+                "total": self.total,
+                "counters": dict(self.counters),
+            }
+
     def _measure_speed(self):
         self.set_state("measuring", "Ключи готовы, измеряю скорость")
         with ThreadPoolExecutor(max_workers=min(4, self.cfg["workers"])) as ex:
             fmap = {
-                ex.submit(checker.check_speed, item["info"], self.cfg["speed_url"]): item
+                ex.submit(checker.check_speed, item["info"], [self.cfg["speed_url"]], stop_event=self.stop_event): item
                 for item in self.results
             }
             for fut in as_completed(fmap):
@@ -207,6 +311,7 @@ class Job:
                 require_sni=filters["require_sni"],
                 exclude_ws=filters["exclude_ws"],
             )
+            infos = self._dedupe(infos)
             infos = self._filter_countries(infos)
             if self.stop_event.is_set():
                 self.set_state("stopped", "Остановлено во время определения стран")
@@ -221,55 +326,41 @@ class Job:
             if not infos:
                 self.set_state("failed", "После загрузки и фильтров ключей не осталось")
                 return
-            self.set_state("running", "Проверяю каждый ключ через полный каскад")
-            iterator = iter(infos)
-            pending = set()
-            executor = ThreadPoolExecutor(max_workers=self.cfg["workers"])
-            try:
-                for _ in range(min(self.cfg["workers"], len(infos))):
-                    pending.add(executor.submit(self._check_one, next(iterator)))
-                while pending and not self.stop_event.is_set():
-                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
-                    for fut in done:
-                        stage, item = fut.result()
-                        with self.lock:
-                            self.checked += 1
-                            if stage != "found" and stage in self.counters:
-                                self.counters[stage] += 1
-                        if stage == "found" and item is not None:
-                            accept = False
-                            with self.lock:
-                                if len(self.results) < self.cfg["count"]:
-                                    self.results.append(item)
-                                    self.counters["found"] += 1
-                                    accept = True
-                            if accept:
-                                store.save_result(item)
-                                self.emit("key_found", public_result(item))
-                        self.emit("progress", self.snapshot())
-                    if len(self.results) >= self.cfg["count"]:
-                        break
-                    for _ in range(len(done)):
-                        try:
-                            pending.add(executor.submit(self._check_one, next(iterator)))
-                        except StopIteration:
-                            break
-                for fut in pending:
-                    fut.cancel()
-            finally:
-                executor.shutdown(wait=True, cancel_futures=True)
+            self.set_state("running", "Проверяю доступность серверов")
+            survivors = self._run_pool(
+                infos, self._probe, max(self.cfg["workers"], PREFILTER_WORKERS),
+            )
+            if self.stop_event.is_set():
+                self.set_state("stopped", "Остановлено, найдено ключей: %d" % len(self.results))
+                return
+            self.set_state("running", "Проверяю выжившие ключи через Xray")
+            self._run_pool(survivors, self._finish, self.cfg["workers"])
             if self.stop_event.is_set():
                 self.set_state("stopped", f"Остановлено, найдено ключей: {len(self.results)}")
                 return
             if self.cfg["speed"] and self.results and checker.XRAY_BIN:
                 self._measure_speed()
             found = len(self.results)
+            if self.cfg.get("prune_working"):
+                successful = {item["info"]["raw"] for item in self.results}
+                stale = set(self.cfg.get("working_snapshot") or []) - successful
+                # Drop keys another job saved after this snapshot was taken.
+                stale -= store.saved_since(self.cfg.get("snapshot_time") or 0, stale)
+                removed = store.delete_working(stale)
+                self.emit("working_pruned", {"removed": removed, "remaining": found})
+                self.set_state(
+                    "completed",
+                    f"Перепроверка завершена: осталось {found}, удалено {removed}",
+                )
+                return
             if found >= self.cfg["count"]:
                 self.set_state("completed", f"Найдено {found} ключей")
             else:
                 self.set_state("completed", f"Проверка завершена: найдено {found} из {self.cfg['count']}")
         except Exception as exc:
-            self.set_state("failed", f"Ошибка задания: {exc}")
+            self.set_state("failed", "Ошибка задания: %s" % exc)
+        finally:
+            self.finished_at = time.time()
 
 
 class Jobs:
@@ -285,8 +376,20 @@ class Jobs:
         return job
 
     def get(self, job_id):
+        self.cleanup()
         with self.lock:
             return self.items.get(job_id)
+
+    def cleanup(self):
+        """Drop finished jobs past the TTL so results do not live forever."""
+        cutoff = time.time() - JOB_TTL_SECONDS
+        with self.lock:
+            stale = [
+                job_id for job_id, job in self.items.items()
+                if job.finished_at and job.finished_at < cutoff
+            ]
+            for job_id in stale:
+                del self.items[job_id]
 
 
 jobs = Jobs()

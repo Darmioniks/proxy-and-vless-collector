@@ -10,7 +10,7 @@ import urllib.parse
 APP_NAME = "Proxy Manager"
 HAPP_SUBSCRIPTION_URL = (
     "https://raw.githubusercontent.com/"
-    "Darmioniks/mtproto-proxy-tg/main/vless_filtered.txt"
+    "Darmioniks/proxy-and-vless-collector/main/vless_filtered.txt"
 )
 
 
@@ -26,10 +26,47 @@ def app_data_dir():
     return path
 
 
-def free_port():
+PORT_FILE = "subscription_port.txt"
+
+
+def load_saved_port():
+    path = os.path.join(app_data_dir(), PORT_FILE)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            port = int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
+def save_port(port):
+    path = os.path.join(app_data_dir(), PORT_FILE)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(str(port))
+
+
+def choose_port():
+    """Stable across launches: PM_SUB_PORT, then the saved port, then a free one."""
+    env = os.environ.get("PM_SUB_PORT")
+    candidates = []
+    if env and env.isdigit():
+        candidates.append(int(env))
+    saved = load_saved_port()
+    if saved and saved not in candidates:
+        candidates.append(saved)
+    for port in candidates:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("127.0.0.1", port))
+            save_port(port)
+            return port
+        except OSError:
+            continue
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+        port = sock.getsockname()[1]
+    save_port(port)
+    return port
 
 
 def wait_server(port, timeout=10):
@@ -64,6 +101,15 @@ def happ_link(subscription_url=HAPP_SUBSCRIPTION_URL):
     return f"happ://add/{subscription_url}"
 
 
+def valid_local_subscription(url):
+    parsed = urllib.parse.urlparse(url)
+    return (
+        parsed.scheme == "http"
+        and parsed.hostname in ("127.0.0.1", "localhost")
+        and parsed.path.startswith("/sub/")
+    )
+
+
 class DesktopApi:
     def get_state(self):
         return {
@@ -72,25 +118,32 @@ class DesktopApi:
             "subscriptionUrl": HAPP_SUBSCRIPTION_URL,
         }
 
-    def open_happ(self):
+    def open_happ(self, subscription_url=None):
+        subscription_url = subscription_url or HAPP_SUBSCRIPTION_URL
+        if subscription_url != HAPP_SUBSCRIPTION_URL and not valid_local_subscription(subscription_url):
+            return {
+                "ok": False,
+                "error": "Некорректная ссылка подписки.",
+                "subscriptionUrl": subscription_url,
+            }
         if not happ_command():
             return {
                 "ok": False,
                 "error": "Happ не найден. Ссылка подписки скопирована в буфер обмена.",
-                "subscriptionUrl": HAPP_SUBSCRIPTION_URL,
+                "subscriptionUrl": subscription_url,
             }
         try:
-            os.startfile(happ_link())
+            os.startfile(happ_link(subscription_url))
             return {
                 "ok": True,
                 "message": "Happ открыт. Подтвердите добавление подписки в приложении.",
-                "subscriptionUrl": HAPP_SUBSCRIPTION_URL,
+                "subscriptionUrl": subscription_url,
             }
         except OSError as err:
             return {
                 "ok": False,
                 "error": f"Не удалось открыть Happ: {err}",
-                "subscriptionUrl": HAPP_SUBSCRIPTION_URL,
+                "subscriptionUrl": subscription_url,
             }
 
     def open_telegram_proxy(self, link):
@@ -112,7 +165,7 @@ def main():
 
     from server import app
 
-    port = free_port()
+    port = choose_port()
     config = uvicorn.Config(
         app, host="127.0.0.1", port=port, log_level="warning", access_log=False
     )

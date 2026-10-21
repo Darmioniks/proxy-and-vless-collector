@@ -1,3 +1,4 @@
+import html
 import streamlit as st
 import requests
 import urllib.parse
@@ -181,11 +182,10 @@ with tab_mtproto:
             col1, col2, col3 = st.columns([1, 2, 5])
 
             col1.write(f"{idx + 1}")
-            col2.markdown(f"<span style='color: #2a9d8f; font-weight: bold;'>{proxy_data['ping']} мс</span>",
-                          unsafe_allow_html=True)
+            col2.write(f"{proxy_data['ping']} мс")
 
             col3.markdown(
-                f"<a href='{tg_link}' style='display: inline-block; background-color: #3390ec; color: white; padding: 5px 10px; border-radius: 6px; text-decoration: none; font-size: 14px; font-weight: bold;'>Подключить в Telegram</a>",
+                f"<a href='{html.escape(tg_link, quote=True)}' style='display: inline-block; background-color: #3390ec; color: white; padding: 5px 10px; border-radius: 6px; text-decoration: none; font-size: 14px; font-weight: bold;'>Подключить в Telegram</a>",
                 unsafe_allow_html=True)
 
             st.markdown(
@@ -302,7 +302,7 @@ with tab_vless:
             host = extract_vless_host(item['key'])
             display = name if name != "VLESS Ключ" else host
             sc2.markdown(
-                f"<span title='{item['key']}' style='font-size:12px; word-break:break-all;'>{display}</span>",
+                f"<span title='{html.escape(item['key'], quote=True)}' style='font-size:12px; word-break:break-all;'>{html.escape(str(display))}</span>",
                 unsafe_allow_html=True
             )
             sc3.markdown(
@@ -409,7 +409,7 @@ with tab_vless:
             c1, c2, c3 = st.columns([1, 4, 2])
             c1.write(str(global_idx))
             c2.markdown(
-                f"<span title='{key}' style='font-size:13px; word-break:break-all;'>{display_name}</span>",
+                f"<span title='{html.escape(key, quote=True)}' style='font-size:13px; word-break:break-all;'>{html.escape(str(display_name))}</span>",
                 unsafe_allow_html=True
             )
             # Кнопка копирования через st.code (компактная)
