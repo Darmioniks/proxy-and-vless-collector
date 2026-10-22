@@ -280,5 +280,25 @@ class JobTest(unittest.TestCase):
         self.assertEqual(events[-1]["type"], "state")
         self.assertEqual(events[-1]["data"]["state"], "completed")
 
+
+class SubscriptionCleanupTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.old_db = store.DB_FILE
+        store.DB_FILE = os.path.join(self.dir.name, "test.db")
+        store.init_db()
+
+    def tearDown(self):
+        store.DB_FILE = self.old_db
+        self.dir.cleanup()
+
+    def test_expired_subscriptions_are_deleted_and_permanent_ones_kept(self):
+        expired_token, expires = store.create_subscription(["vless://a"], "short", ttl_minutes=1)
+        permanent_token, _ = store.create_subscription(["vless://b"], "forever")
+        removed = store.purge_expired_subscriptions(now=expires)
+        self.assertEqual(removed, 1)
+        self.assertIsNone(store.get_subscription(expired_token))
+        self.assertIsNotNone(store.get_subscription(permanent_token))
+
 if __name__ == "__main__":
     unittest.main()

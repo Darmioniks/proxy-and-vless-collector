@@ -207,11 +207,23 @@ def save_geo(items):
         """, [(ip, country, now) for ip, country in items.items() if country])
 
 
+def purge_expired_subscriptions(now=None):
+    """Delete subscriptions past their expiry. Returns the number removed."""
+    now = int(time.time()) if now is None else now
+    with connect() as db:
+        cursor = db.execute(
+            "DELETE FROM subscriptions WHERE expires_at IS NOT NULL AND expires_at <= ?",
+            (now,),
+        )
+        return cursor.rowcount
+
+
 def create_subscription(keys, name, ttl_minutes=None):
     token = secrets.token_urlsafe(12)
     body = base64.b64encode("\n".join(keys).encode("utf-8")).decode("ascii")
     now = int(time.time())
     expires = now + ttl_minutes * 60 if ttl_minutes else None
+    purge_expired_subscriptions(now)
     with connect() as db:
         db.execute(
             "INSERT INTO subscriptions VALUES (?, ?, ?, ?, ?, ?)",

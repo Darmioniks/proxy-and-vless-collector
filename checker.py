@@ -42,6 +42,8 @@ VALIDATION_URLS = [
 VALIDATION_DOWNLOAD_URL = "https://speed.cloudflare.com/__down?bytes=1000000"
 VALIDATION_MIN_SUCCESS = 2
 VALIDATION_MIN_BYTES = 256 * 1024
+# Speed measurement stops at this many bytes or at its timeout, whichever comes first.
+SPEED_MAX_BYTES = 10 * 1024 * 1024
 VLESS_SOURCES = [
     "https://gitverse.ru/api/repos/cid-uskoritel/cid-white/raw/branch/master/whitelist.txt",
     "https://gitverse.ru/api/repos/LowiK/LowiKLive/raw/branch/main/ObhodBSfree.txt",
@@ -650,6 +652,9 @@ def check_speed(info, urls=None, timeout=12, stop_event=None):
                         return None
                     if chunk:
                         size += len(chunk)
+                    # A large speed_url must not hold the Xray slot for minutes.
+                    if size >= SPEED_MAX_BYTES or time.time() - start > timeout:
+                        break
                 elapsed = max(time.time() - start, 0.001)
                 if size:
                     return round(size * 8 / elapsed / 1_000_000, 2)

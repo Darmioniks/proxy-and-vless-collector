@@ -157,21 +157,6 @@ class Job:
                 return "tls_failed", None
         return "ready", (info, tcp)
 
-    def _check_one(self, info):
-        stage, tcp = self._probe(info)
-        if stage != "ready":
-            return stage, None
-        if self.stop_event.is_set():
-            return "stopped", None
-        ping = tcp
-        if self.cfg["enable_xray"]:
-            ping = checker.check_xray(info, self.cfg["test_url"], stop_event=self.stop_event)
-            if ping is None:
-                return "stopped" if self.stop_event.is_set() else "xray_failed", None
-        item = {"info": info, "ping": ping, "speed": None}
-        item["score"] = checker.score(info, ping)
-        return "found", item
-
     def _dedupe(self, infos):
         """One key per uuid/host/port/params. The #name fragment is display only."""
         seen = {}
