@@ -35,6 +35,7 @@ jobs:
 
           unique_vless = set()
           stats = {}
+          answered = 0
 
           for url in SOURCES:
               source_name = url.split("/")[-1]
@@ -49,6 +50,7 @@ jobs:
                           unique_vless.add(line)
                           found += 1
                   stats[source_name] = found
+                  answered += 1
                   print(f"\u2705 {source_name}: found {found} vless keys")
               except Exception as e:
                   print(f"\u274c {source_name}: {e}")
@@ -66,6 +68,13 @@ jobs:
           if os.path.exists("vless.txt"):
               with open("vless.txt", encoding="utf-8") as f:
                   previous = {line.strip() for line in f if line.strip().startswith("vless://")}
+          # Частичный сбой источников не должен заменить список урезанным.
+          if answered < len(SOURCES) // 2:
+              print(f"Ответили только {answered} из {len(SOURCES)} источников, vless.txt не изменён.")
+              raise SystemExit(0)
+          if previous and total < len(previous) * 0.5:
+              print(f"Ключей стало {total} вместо {len(previous)}, vless.txt не изменён.")
+              raise SystemExit(0)
           if previous == unique_vless:
               # Заголовок с временем меняется при каждой записи, поэтому сравниваем только ключи.
               print("Набор ключей не изменился, vless.txt не перезаписан.")

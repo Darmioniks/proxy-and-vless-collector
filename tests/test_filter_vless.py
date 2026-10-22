@@ -16,15 +16,20 @@ def key(query, host="good.example", port=443, name="name"):
 
 
 class ProbeTest(unittest.TestCase):
+    def setUp(self):
+        resolver = patch("checker.resolve_pinned", side_effect=lambda host: host)
+        resolver.start()
+        self.addCleanup(resolver.stop)
+
     def info(self, query, host="good.example"):
         return checker.parse_vless(key(query, host=host))
 
+    def probe(self, info):
+        return filter_vless.probe(info, checker.CheckCache(), checker.CheckCache(), checker.CheckCache())
+
     def test_private_host_is_dropped_before_tcp(self):
         with patch("filter_vless.checker.check_tcp") as tcp:
-            result = filter_vless.probe(
-                self.info("security=none&type=tcp", host="10.0.0.5"),
-                checker.CheckCache(), checker.CheckCache(),
-            )
+            result = self.probe(self.info("security=none&type=tcp", host="10.0.0.5"))
         self.assertIsNone(result)
         tcp.assert_not_called()
 
@@ -32,7 +37,7 @@ class ProbeTest(unittest.TestCase):
         query = "security=reality&type=tcp&sni=a.com&pbk=pub"
         with patch("filter_vless.checker.check_tcp", return_value=5), \
                 patch("filter_vless.checker.check_tls", return_value=None) as tls:
-            result = filter_vless.probe(self.info(query), checker.CheckCache(), checker.CheckCache())
+            result = self.probe(self.info(query))
         self.assertIsNotNone(result)
         tls.assert_not_called()
 
@@ -40,8 +45,15 @@ class ProbeTest(unittest.TestCase):
         query = "security=tls&type=tcp&sni=a.com"
         with patch("filter_vless.checker.check_tcp", return_value=5), \
                 patch("filter_vless.checker.check_tls", return_value=None):
-            result = filter_vless.probe(self.info(query), checker.CheckCache(), checker.CheckCache())
+            result = self.probe(self.info(query))
         self.assertIsNone(result)
+
+    def test_probe_pins_connection_to_resolved_address(self):
+        with patch("filter_vless.checker.resolve_pinned", return_value="203.0.113.7"), \
+                patch("filter_vless.checker.check_tcp", return_value=5) as tcp:
+            result = self.probe(self.info("security=none&type=tcp"))
+        tcp.assert_called_once_with("203.0.113.7", 443)
+        self.assertEqual(result["connect_host"], "203.0.113.7")
 
 
 class DedupeTest(unittest.TestCase):

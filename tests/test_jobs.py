@@ -17,6 +17,10 @@ class JobTest(unittest.TestCase):
         self.old_db = store.DB_FILE
         store.DB_FILE = os.path.join(self.dir.name, "test.db")
         store.init_db()
+        # Fake hosts do not resolve; treat names as public. Address pinning has its own tests.
+        resolver = patch("checker.resolve_pinned", side_effect=lambda host: host)
+        resolver.start()
+        self.addCleanup(resolver.stop)
 
     def tearDown(self):
         store.DB_FILE = self.old_db

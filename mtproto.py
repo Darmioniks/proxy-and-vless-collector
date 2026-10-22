@@ -51,10 +51,11 @@ def load_source(url, timeout=12):
 
 
 def _tcp_public(host, port):
-    """TCP ping for public servers only: names that resolve to local addresses are skipped."""
-    if checker.resolves_private(host):
+    """TCP ping for public servers only, to the address the name resolved to."""
+    ip = checker.resolve_pinned(host)
+    if ip is None:
         return None
-    return checker.check_tcp(host, port)
+    return checker.check_tcp(ip, port)
 
 
 def scan(limit=80, workers=100):

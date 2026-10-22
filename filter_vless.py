@@ -38,20 +38,23 @@ def load_infos(path):
     return list(seen.values())
 
 
-def probe(info, tcp_cache, tls_cache):
-    """Returns info if the server accepts TCP (and TLS for security=tls)."""
+def probe(info, tcp_cache, tls_cache, dns_cache):
+    """Returns info pinned to the resolved address if the server accepts TCP (and TLS for security=tls)."""
     host = info["host"]
     port = info["port"]
     if checker.is_private_host(host):
         return None
-    if tcp_cache.get((host, port), lambda: checker.check_tcp(host, port)) is None:
+    ip = dns_cache.get(host, lambda: checker.resolve_pinned(host))
+    if ip is None:
+        return None
+    if tcp_cache.get((ip, port), lambda: checker.check_tcp(ip, port)) is None:
         return None
     p = info["params"]
     if p.get("security", "none") == "tls":
         sni = p.get("sni") or p.get("host") or host
-        if tls_cache.get((host, port, sni), lambda: checker.check_tls(host, port, sni)) is None:
+        if tls_cache.get((ip, port, sni), lambda: checker.check_tls(ip, port, sni)) is None:
             return None
-    return info
+    return dict(info, connect_host=ip)
 
 
 def xray_check(info, test_url, stop):
@@ -111,10 +114,11 @@ def main():
     stop = threading.Event()
     tcp_cache = checker.CheckCache()
     tls_cache = checker.CheckCache()
+    dns_cache = checker.CheckCache()
 
     print(f"[1/2] TCP/TLS: проверяем {len(infos)} ключей...")
     survivors = run_pool(
-        infos, lambda info: probe(info, tcp_cache, tls_cache), PROBE_WORKERS, stop,
+        infos, lambda info: probe(info, tcp_cache, tls_cache, dns_cache), PROBE_WORKERS, stop,
     )
     print(f"[1/2] TCP/TLS: прошли {len(survivors)} ключей")
 

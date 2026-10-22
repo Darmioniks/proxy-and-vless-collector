@@ -35,6 +35,7 @@ class MtprotoTest(unittest.TestCase):
             return {"one.example": 45, "two.example": 20}[host]
 
         with patch("mtproto.requests.get", side_effect=get), \
+                patch("mtproto.checker.resolve_pinned", side_effect=lambda host: host), \
                 patch("mtproto.checker.check_tcp", side_effect=tcp), \
                 patch("mtproto.random.shuffle"):
             result = mtproto.scan(limit=10, workers=2)
