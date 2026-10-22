@@ -181,20 +181,36 @@ def is_private_host(host):
     return is_private_ip(ip)
 
 
-def resolves_private(host):
-    """True if the name resolves to any non-global address. Unresolvable names are False."""
+def resolve_pinned(host):
+    """The one address to connect to for host, or None if the host is unusable.
+
+    None means: the name does not resolve, or any address it resolves to is not
+    globally routable. Callers connect to the returned address, so a later lookup
+    cannot return a different (rebinding) address.
+    """
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        return None if is_private_ip(literal) else host
     try:
         rows = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
     except (OSError, UnicodeError):
-        return False
+        return None
+    addresses = []
     for row in rows:
         try:
             ip = ipaddress.ip_address(row[4][0].split("%", 1)[0])
         except ValueError:
             continue
         if is_private_ip(ip):
-            return True
-    return False
+            return None
+        addresses.append(str(ip))
+    if not addresses:
+        return None
+    ipv4 = [address for address in addresses if ":" not in address]
+    return (ipv4 or addresses)[0]
 
 
 def key_identity(info):
@@ -258,16 +274,17 @@ def filter_infos(infos, security="any", only_tcp=False, require_sni=False, exclu
     return out
 
 
-def resolve_hosts(hosts, report=None, stop_event=None):
+def resolve_hosts(hosts, report=None, stop_event=None, cache=None):
+    """Map each host to its pinned address (see resolve_pinned); unusable hosts are left out.
+
+    Pass the job's cache so the probe reuses these lookups instead of resolving again.
+    """
     resolved = {}
 
     def resolve(host):
-        try:
-            rows = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-            ipv4 = [row[4][0] for row in rows if row[0] == socket.AF_INET]
-            return ipv4[0] if ipv4 else rows[0][4][0]
-        except Exception:
-            return None
+        if cache is not None:
+            return cache.get(host, lambda: resolve_pinned(host))
+        return resolve_pinned(host)
 
     hosts = list(dict.fromkeys(hosts))
     done = 0
@@ -456,7 +473,8 @@ def vless_to_outbound(info):
     return {
         "protocol": "vless",
         "settings": {"vnext": [{
-            "address": info["host"], "port": info["port"], "users": [user]
+            "address": info.get("connect_host", info["host"]), "port": info["port"],
+            "users": [user],
         }]},
         "streamSettings": stream,
     }

@@ -5,6 +5,8 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed
 
 # Cheap TCP/DNS probes and heavy Xray checks use separate pools.
 PREFILTER_WORKERS = 64
+# Queued Xray checks allowed per Xray worker before new probes wait.
+XRAY_BACKLOG = 4
 # Finished jobs stay readable this long, then their results are dropped.
 JOB_TTL_SECONDS = 3600
 
@@ -55,6 +57,7 @@ class Job:
         self.tcp_cache = checker.CheckCache()
         self.tls_cache = checker.CheckCache()
         self.dns_cache = checker.CheckCache()
+        self.xray_stop = threading.Event()
         self.emit("created", {"message": self.message})
 
     def _append(self, kind, data=None):
@@ -110,6 +113,7 @@ class Job:
 
     def stop(self):
         self.stop_event.set()
+        self.xray_stop.set()
         self.emit("stopping", {"message": "Останавливаю новые проверки"})
 
     def _load(self):
@@ -135,27 +139,28 @@ class Job:
             return "stopped", None
         host = info["host"]
         port = info["port"]
-        if checker.is_private_host(host) or self.dns_cache.get(
-            host, lambda: checker.resolves_private(host),
-        ):
+        if checker.is_private_host(host):
             return "tcp_failed", None
-        tcp_key = (host, port)
+        # Pin the address once: TCP, TLS and Xray all connect to it, so a name cannot
+        # resolve to a private address after the check (DNS rebinding).
+        ip = self.dns_cache.get(host, lambda: checker.resolve_pinned(host))
+        if ip is None:
+            return "tcp_failed", None
         tcp = self.tcp_cache.get(
-            tcp_key, lambda: checker.check_tcp(host, port) if not self.stop_event.is_set() else None,
+            (ip, port), lambda: checker.check_tcp(ip, port) if not self.stop_event.is_set() else None,
         )
         if tcp is None:
             return "tcp_failed", None
         p = info["params"]
         if p.get("security", "none") == "tls":
             sni = p.get("sni") or p.get("host") or host
-            tls_key = (host, port, sni)
             tls = self.tls_cache.get(
-                tls_key,
-                lambda: checker.check_tls(host, port, sni) if not self.stop_event.is_set() else None,
+                (ip, port, sni),
+                lambda: checker.check_tls(ip, port, sni) if not self.stop_event.is_set() else None,
             )
             if tls is None:
                 return "tls_failed", None
-        return "ready", (info, tcp)
+        return "ready", (dict(info, connect_host=ip), tcp)
 
     def _dedupe(self, infos):
         """One key per uuid/host/port/params. The #name fragment is display only."""
@@ -181,7 +186,7 @@ class Job:
 
         host_ip = checker.resolve_hosts(
             [info["host"] for info in infos], report=report,
-            stop_event=self.stop_event,
+            stop_event=self.stop_event, cache=self.dns_cache,
         )
         ips = list(dict.fromkeys(host_ip.values()))
         cached = store.get_geo(ips)
@@ -235,15 +240,21 @@ class Job:
         New probes are submitted only while the target is not reached and no stop was requested.
         Running Xray checks are not cancelled here; they finish within their own timeouts.
         """
+        workers = max(1, self.cfg["workers"])
         probe_pool = ThreadPoolExecutor(max_workers=PREFILTER_WORKERS)
-        xray_pool = ThreadPoolExecutor(max_workers=max(1, self.cfg["workers"]))
+        xray_pool = ThreadPoolExecutor(max_workers=workers)
         probe_pending = set()
         xray_pending = set()
         remaining = iter(infos)
         exhausted = False
         try:
             while not self.stop_event.is_set() and len(self.results) < self.cfg["count"]:
-                while not exhausted and len(probe_pending) < PREFILTER_WORKERS:
+                # Backpressure: probes wait while Xray already has a backlog to work through.
+                while (
+                    not exhausted
+                    and len(probe_pending) < PREFILTER_WORKERS
+                    and len(xray_pending) < XRAY_BACKLOG * workers
+                ):
                     try:
                         info = next(remaining)
                     except StopIteration:
@@ -266,11 +277,26 @@ class Job:
                         xray_pending.discard(fut)
                         self._count(*fut.result())
         finally:
+            # Running Xray checks end at their next check point instead of running out their timeouts.
+            self.xray_stop.set()
             for fut in probe_pending | xray_pending:
                 fut.cancel()
             wait_for_running = not self.stop_event.is_set()
             probe_pool.shutdown(wait=wait_for_running, cancel_futures=True)
             xray_pool.shutdown(wait=wait_for_running, cancel_futures=True)
+            self._keep_late_finds(xray_pending)
+
+    def _keep_late_finds(self, futures):
+        """Save working keys that finished after the target was reached.
+
+        They are not added to this job's results, but they are working keys and belong in the database.
+        """
+        for fut in futures:
+            if not fut.done() or fut.cancelled() or fut.exception() is not None:
+                continue
+            stage, item = fut.result()
+            if stage == "found":
+                store.save_result(item)
 
     def _finish(self, payload):
         """Heavy stage: Xray url test for a key that already passed the probe."""
@@ -279,9 +305,9 @@ class Job:
             return "stopped", None
         ping = tcp
         if self.cfg["enable_xray"]:
-            ping = checker.check_xray(info, self.cfg["test_url"], stop_event=self.stop_event)
+            ping = checker.check_xray(info, self.cfg["test_url"], stop_event=self.xray_stop)
             if ping is None:
-                return "stopped" if self.stop_event.is_set() else "xray_failed", None
+                return "stopped" if self.xray_stop.is_set() else "xray_failed", None
         item = {"info": info, "ping": ping, "speed": None}
         item["score"] = checker.score(info, ping)
         return "found", item

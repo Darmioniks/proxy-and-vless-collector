@@ -107,8 +107,12 @@ class NetworkRulesTest(unittest.TestCase):
         self.assertTrue(checker.is_private_host("printer.local"))
         self.assertTrue(checker.is_private_host("svc.internal"))
 
-    def test_name_resolving_to_loopback_is_private(self):
-        self.assertTrue(checker.resolves_private("localhost"))
+    def test_name_resolving_to_loopback_has_no_address(self):
+        self.assertIsNone(checker.resolve_pinned("localhost"))
+
+    def test_public_literal_is_its_own_address(self):
+        self.assertEqual(checker.resolve_pinned("8.8.8.8"), "8.8.8.8")
+        self.assertIsNone(checker.resolve_pinned("127.0.0.1"))
 
     def test_xray_slot_wait_ends_only_on_stop(self):
         stop = threading.Event()
