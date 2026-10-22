@@ -254,12 +254,13 @@ function updateResult(item) {
 }
 
 async function refreshJob() {
-    if (!activeJob) return;
+    if (!activeJob) return null;
     const response = await fetch(`/api/jobs/${activeJob}`);
-    if (!response.ok) return;
+    if (!response.ok) return null;
     const data = await response.json();
     updateProgress(data);
     data.results.forEach(updateResult);
+    return data;
 }
 
 function openStream(jobId) {
@@ -294,7 +295,12 @@ function openStream(jobId) {
         $('#geo-matched').textContent = data.matched;
         $('#job-message').textContent = `По странам подошло ${data.matched} из ${data.before}; не определено: ${data.unknown}`;
     });
-    stream.onerror = () => refreshJob();
+    // EventSource reconnects by itself; once the job is finished there is nothing
+    // left to stream, so close instead of reconnecting in a loop.
+    stream.onerror = async () => {
+        const job = await refreshJob();
+        if (job && ['completed', 'failed', 'stopped'].includes(job.state)) stream.close();
+    };
 }
 
 $('#job-form').addEventListener('submit', async (event) => {

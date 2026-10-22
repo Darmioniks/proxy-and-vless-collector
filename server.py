@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 import checker
 import mtproto
 import store
-from jobs import TERMINAL_STATES, jobs
+from jobs import jobs
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -141,7 +141,8 @@ def read_job(job_id: str):
 
 @app.get("/api/jobs/{job_id}/events")
 async def job_events(job_id: str, request: Request, cursor: int = 0):
-    if rate_limited("api"):
+    # Own bucket: a reconnecting stream must not use up the limit for job and subscription calls.
+    if rate_limited("sse"):
         raise HTTPException(status_code=429, detail="Слишком много запросов, повторите позже")
     job = get_job(job_id)
     last_event_id = request.headers.get("last-event-id")
@@ -153,12 +154,14 @@ async def job_events(job_id: str, request: Request, cursor: int = 0):
         while True:
             if await request.is_disconnected():
                 break
-            events = job.events_after(current)
+            # Events and the finished flag come from one snapshot, so the terminal
+            # state event is always sent before the stream closes.
+            events, finished = job.poll(current)
             for event in events:
                 current = event["id"]
                 body = json.dumps(event["data"], ensure_ascii=False)
                 yield f"id: {current}\nevent: {event['type']}\ndata: {body}\n\n"
-            if job.state in TERMINAL_STATES and not events:
+            if finished and not events:
                 break
             yield ": ping\n\n"
             await asyncio.sleep(0.5)
@@ -279,4 +282,6 @@ def recheck_working(req: WorkingRecheckRequest):
 
 @app.post("/api/telegram/scan")
 def scan_telegram(req: TelegramRequest):
+    if rate_limited("telegram"):
+        raise HTTPException(status_code=429, detail="Слишком много запросов, повторите позже")
     return mtproto.scan(req.limit)

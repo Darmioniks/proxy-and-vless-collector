@@ -83,7 +83,9 @@ def parse_vless(raw):
         params = {}
         if "?" in body:
             body, qs = body.split("?", 1)
-            params = {k: v[0] for k, v in urllib.parse.parse_qs(qs).items()}
+            # '+' is a literal plus in VLESS URIs; parse_qs would turn it into a space.
+            # Values are decoded exactly once here and nowhere else.
+            params = {k: v[0] for k, v in urllib.parse.parse_qs(qs.replace("+", "%2B")).items()}
         if "@" not in body:
             return None
         uuid, host_part = body.split("@", 1)
@@ -159,16 +161,38 @@ def normalize_params(params):
     return out
 
 
+def is_private_ip(ip):
+    """True for any address that is not globally routable (CGNAT, loopback, LAN, ...)."""
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return not ip.is_global or ip.is_multicast or ip.is_unspecified
+
+
 def is_private_host(host):
-    """True для loopback, частных, link-local и иных неглобальных адресов."""
+    """True for a private IP literal or a local host name. Names are not resolved here."""
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
-        return host in ("localhost", "localhost.localdomain") or host.endswith(".local")
-    return (
-        ip.is_private or ip.is_loopback or ip.is_link_local
-        or ip.is_reserved or ip.is_multicast or ip.is_unspecified
-    )
+        return host in ("localhost", "localhost.localdomain") or host.endswith(
+            (".local", ".localhost", ".internal")
+        )
+    return is_private_ip(ip)
+
+
+def resolves_private(host):
+    """True if the name resolves to any non-global address. Unresolvable names are False."""
+    try:
+        rows = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return False
+    for row in rows:
+        try:
+            ip = ipaddress.ip_address(row[4][0].split("%", 1)[0])
+        except ValueError:
+            continue
+        if is_private_ip(ip):
+            return True
+    return False
 
 
 def key_identity(info):
@@ -352,14 +376,14 @@ def check_tls(host, port, sni, timeout=3.0):
         return None
 
 
-def _percent_path(value, default="/"):
-    """path/spiderX from URI is percent-encoded, Xray wants plain text."""
-    text = urllib.parse.unquote(value or "").strip() or default
+def _path_value(value, default="/"):
+    """path/spiderX as parsed by parse_vless (already decoded once)."""
+    text = (value or "").strip() or default
     return text if text.startswith("/") else "/" + text
 
 
 def _xhttp_extra(raw):
-    text = urllib.parse.unquote(raw or "").strip()
+    text = (raw or "").strip()
     if not text:
         return {}
     try:
@@ -392,11 +416,11 @@ def vless_to_outbound(info):
         stream["realitySettings"] = {
             "serverName": p.get("sni", ""), "fingerprint": p.get("fp", "chrome"),
             "publicKey": p.get("pbk", ""), "shortId": p.get("sid", ""),
-            "spiderX": _percent_path(p.get("spx"), "/"),
+            "spiderX": _path_value(p.get("spx"), "/"),
         }
     if network == "ws":
         stream["wsSettings"] = {
-            "path": _percent_path(p.get("path"), "/"),
+            "path": _path_value(p.get("path"), "/"),
             "headers": {"Host": p.get("host", info["host"])},
         }
     elif network == "grpc":
@@ -409,7 +433,7 @@ def vless_to_outbound(info):
         }
     elif network == "xhttp":
         settings = {
-            "path": _percent_path(p.get("path"), "/"),
+            "path": _path_value(p.get("path"), "/"),
             "host": p.get("host", ""),
         }
         mode = p.get("mode", "")
@@ -422,7 +446,7 @@ def vless_to_outbound(info):
         stream["xhttpSettings"] = settings
     elif network == "httpupgrade":
         stream["httpupgradeSettings"] = {
-            "path": _percent_path(p.get("path"), "/"),
+            "path": _path_value(p.get("path"), "/"),
             "host": p.get("host", info["host"]),
         }
     elif network == "kcp":
@@ -509,15 +533,17 @@ def _stop_xray(proc, path):
             pass
 
 
-def _acquire_xray_slot(stop_event, timeout):
-    """Take one global Xray process slot, honouring cancellation."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+def _acquire_xray_slot(stop_event):
+    """Wait for a global Xray slot; only a stop request cancels the wait.
+
+    Slots are always released in finally, so the wait ends when another check
+    finishes. A deadline here would turn a busy slot into a fake xray_failed.
+    """
+    while True:
         if stop_event is not None and stop_event.is_set():
             return False
         if XRAY_SLOTS.acquire(timeout=0.2):
             return True
-    return False
 
 
 def _download_bytes(url, proxies, timeout, stop_event, min_bytes):
@@ -549,7 +575,7 @@ def _download_bytes(url, proxies, timeout, stop_event, min_bytes):
 def check_xray(info, test_url=DEFAULT_TEST_URL, timeout=8, stop_event=None,
                download_url=VALIDATION_DOWNLOAD_URL, min_success=VALIDATION_MIN_SUCCESS,
                min_bytes=VALIDATION_MIN_BYTES):
-    if not XRAY_BIN or not _acquire_xray_slot(stop_event, timeout):
+    if not XRAY_BIN or not _acquire_xray_slot(stop_event):
         return None
     proc = None
     path = None
@@ -600,7 +626,7 @@ def check_speed(info, urls=None, timeout=12, stop_event=None):
     if isinstance(urls, str):
         urls = [urls]
     urls = [url for url in (urls or [DEFAULT_SPEED_URL]) if url]
-    if not XRAY_BIN or not urls or not _acquire_xray_slot(stop_event, timeout):
+    if not XRAY_BIN or not urls or not _acquire_xray_slot(stop_event):
         return None
     proc = None
     path = None

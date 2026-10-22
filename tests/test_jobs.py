@@ -272,5 +272,13 @@ class JobTest(unittest.TestCase):
         registry.items[job.id] = job
         self.assertIsNone(registry.get(job.id))
 
+    def test_finished_state_and_its_event_are_seen_together(self):
+        job = Job(self.cfg("", count=1))
+        job.set_state("completed", "done")
+        events, finished = job.poll(0)
+        self.assertTrue(finished)
+        self.assertEqual(events[-1]["type"], "state")
+        self.assertEqual(events[-1]["data"]["state"], "completed")
+
 if __name__ == "__main__":
     unittest.main()

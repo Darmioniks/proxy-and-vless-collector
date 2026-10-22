@@ -54,27 +54,34 @@ class Job:
         }
         self.tcp_cache = checker.CheckCache()
         self.tls_cache = checker.CheckCache()
+        self.dns_cache = checker.CheckCache()
         self.emit("created", {"message": self.message})
+
+    def _append(self, kind, data=None):
+        """Caller must hold self.lock."""
+        event = {
+            "id": self.next_event_id,
+            "type": kind,
+            "data": data or {},
+            "ts": time.time(),
+        }
+        self.events.append(event)
+        self.next_event_id += 1
+        if len(self.events) > 10000:
+            self.events = self.events[-8000:]
+        return event
 
     def emit(self, kind, data=None):
         with self.lock:
-            event = {
-                "id": self.next_event_id,
-                "type": kind,
-                "data": data or {},
-                "ts": time.time(),
-            }
-            self.events.append(event)
-            self.next_event_id += 1
-            if len(self.events) > 10000:
-                self.events = self.events[-8000:]
-            return event
+            return self._append(kind, data)
 
     def set_state(self, state, message):
+        # The state and its "state" event change under one lock, so a stream
+        # never sees a finished state without the event that announces it.
         with self.lock:
             self.state = state
             self.message = message
-        self.emit("state", {"state": state, "message": message})
+            self._append("state", {"state": state, "message": message})
 
     def snapshot(self):
         with self.lock:
@@ -94,6 +101,12 @@ class Job:
     def events_after(self, event_id):
         with self.lock:
             return [event for event in self.events if event["id"] > event_id]
+
+    def poll(self, event_id):
+        """Events after event_id and whether the job is finished, read under one lock."""
+        with self.lock:
+            events = [event for event in self.events if event["id"] > event_id]
+            return events, self.state in TERMINAL_STATES
 
     def stop(self):
         self.stop_event.set()
@@ -122,7 +135,9 @@ class Job:
             return "stopped", None
         host = info["host"]
         port = info["port"]
-        if checker.is_private_host(host):
+        if checker.is_private_host(host) or self.dns_cache.get(
+            host, lambda: checker.resolves_private(host),
+        ):
             return "tcp_failed", None
         tcp_key = (host, port)
         tcp = self.tcp_cache.get(
@@ -211,53 +226,66 @@ class Job:
         })
         return out
 
-    def _run_pool(self, infos, fn, workers):
-        """Run fn over infos, stopping as soon as the target count is reached.
+    def _count(self, stage, item=None):
+        """Record one finished key; a found key is accepted while the target is not reached."""
+        with self.lock:
+            self.checked += 1
+            if stage != "found" and stage in self.counters:
+                self.counters[stage] += 1
+        if stage == "found" and item is not None:
+            accept = False
+            with self.lock:
+                if len(self.results) < self.cfg["count"]:
+                    self.results.append(item)
+                    self.counters["found"] += 1
+                    accept = True
+            if accept:
+                store.save_result(item)
+                self.emit("key_found", public_result(item))
+        self.emit("progress", self._progress())
 
-        The executor is not waited on after a stop: futures are cancelled and
-        the Xray processes they own see stop_event and exit on their own.
+    def _pipeline(self, infos):
+        """Probe and Xray as one pipeline: a key goes to Xray as soon as its probe passes.
+
+        New probes are submitted only while the target is not reached and no stop was requested.
+        Running Xray checks are not cancelled here; they finish within their own timeouts.
         """
-        iterator = iter(infos)
-        pending = set()
-        survivors = []
-        executor = ThreadPoolExecutor(max_workers=max(1, workers))
+        probe_pool = ThreadPoolExecutor(max_workers=PREFILTER_WORKERS)
+        xray_pool = ThreadPoolExecutor(max_workers=max(1, self.cfg["workers"]))
+        probe_pending = set()
+        xray_pending = set()
+        remaining = iter(infos)
+        exhausted = False
         try:
-            for _ in range(min(workers, len(infos))):
-                pending.add(executor.submit(fn, next(iterator)))
-            while pending and not self.stop_event.is_set():
-                done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
-                for fut in done:
-                    stage, item = fut.result()
-                    if stage == "ready":
-                        survivors.append(item)
-                        continue
-                    with self.lock:
-                        self.checked += 1
-                        if stage != "found" and stage in self.counters:
-                            self.counters[stage] += 1
-                    if stage == "found" and item is not None:
-                        accept = False
-                        with self.lock:
-                            if len(self.results) < self.cfg["count"]:
-                                self.results.append(item)
-                                self.counters["found"] += 1
-                                accept = True
-                        if accept:
-                            store.save_result(item)
-                            self.emit("key_found", public_result(item))
-                    self.emit("progress", self._progress())
-                if len(self.results) >= self.cfg["count"]:
-                    break
-                for _ in range(len(done)):
+            while not self.stop_event.is_set() and len(self.results) < self.cfg["count"]:
+                while not exhausted and len(probe_pending) < PREFILTER_WORKERS:
                     try:
-                        pending.add(executor.submit(fn, next(iterator)))
+                        info = next(remaining)
                     except StopIteration:
+                        exhausted = True
                         break
-            for fut in pending:
-                fut.cancel()
+                    probe_pending.add(probe_pool.submit(self._probe, info))
+                pending = probe_pending | xray_pending
+                if not pending:
+                    break
+                done, _ = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    if fut in probe_pending:
+                        probe_pending.discard(fut)
+                        stage, payload = fut.result()
+                        if stage == "ready":
+                            xray_pending.add(xray_pool.submit(self._finish, payload))
+                        else:
+                            self._count(stage)
+                    else:
+                        xray_pending.discard(fut)
+                        self._count(*fut.result())
         finally:
-            executor.shutdown(wait=not self.stop_event.is_set(), cancel_futures=True)
-        return survivors
+            for fut in probe_pending | xray_pending:
+                fut.cancel()
+            wait_for_running = not self.stop_event.is_set()
+            probe_pool.shutdown(wait=wait_for_running, cancel_futures=True)
+            xray_pool.shutdown(wait=wait_for_running, cancel_futures=True)
 
     def _finish(self, payload):
         """Heavy stage: Xray url test for a key that already passed the probe."""
@@ -326,20 +354,18 @@ class Job:
             if not infos:
                 self.set_state("failed", "После загрузки и фильтров ключей не осталось")
                 return
-            self.set_state("running", "Проверяю доступность серверов")
-            survivors = self._run_pool(
-                infos, self._probe, max(self.cfg["workers"], PREFILTER_WORKERS),
-            )
-            if self.stop_event.is_set():
-                self.set_state("stopped", "Остановлено, найдено ключей: %d" % len(self.results))
-                return
-            self.set_state("running", "Проверяю выжившие ключи через Xray")
-            self._run_pool(survivors, self._finish, self.cfg["workers"])
+            self.set_state("running", "Проверяю доступность серверов и ключи через Xray")
+            self._pipeline(infos)
             if self.stop_event.is_set():
                 self.set_state("stopped", f"Остановлено, найдено ключей: {len(self.results)}")
                 return
             if self.cfg["speed"] and self.results and checker.XRAY_BIN:
                 self._measure_speed()
+                if self.stop_event.is_set():
+                    self.set_state(
+                        "stopped", f"Остановлено при замере скорости, найдено ключей: {len(self.results)}",
+                    )
+                    return
             found = len(self.results)
             if self.cfg.get("prune_working"):
                 successful = {item["info"]["raw"] for item in self.results}
