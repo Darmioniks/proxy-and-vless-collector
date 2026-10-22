@@ -50,7 +50,9 @@ jobs:
                           unique_vless.add(line)
                           found += 1
                   stats[source_name] = found
-                  answered += 1
+                  # A 200 page without keys (stub or captcha) does not count as an answer.
+                  if found:
+                      answered += 1
                   print(f"\u2705 {source_name}: found {found} vless keys")
               except Exception as e:
                   print(f"\u274c {source_name}: {e}")
