@@ -98,5 +98,36 @@ class ParseTest(unittest.TestCase):
         checker.XRAY_SLOTS.release()
 
 
+class NetworkRulesTest(unittest.TestCase):
+    def test_non_global_ranges_are_private(self):
+        for host in ("100.64.0.1", "::ffff:127.0.0.1", "169.254.1.1", "::1", "fe80::1"):
+            self.assertTrue(checker.is_private_host(host), host)
+
+    def test_local_names_are_private(self):
+        self.assertTrue(checker.is_private_host("printer.local"))
+        self.assertTrue(checker.is_private_host("svc.internal"))
+
+    def test_name_resolving_to_loopback_is_private(self):
+        self.assertTrue(checker.resolves_private("localhost"))
+
+    def test_xray_slot_wait_ends_only_on_stop(self):
+        stop = threading.Event()
+        stop.set()
+        self.assertFalse(checker._acquire_xray_slot(stop))
+
+
+class UriDecodingTest(unittest.TestCase):
+    def parse(self, query):
+        return checker.parse_vless(key(query))
+
+    def test_percent_encoding_is_decoded_once(self):
+        info = self.parse("security=none&type=ws&path=%2Fa%2525b")
+        self.assertEqual(checker.vless_to_outbound(info)["streamSettings"]["wsSettings"]["path"], "/a%25b")
+
+    def test_plus_stays_a_plus(self):
+        info = self.parse("security=none&type=ws&path=/a+b")
+        self.assertEqual(info["params"]["path"], "/a+b")
+
+
 if __name__ == "__main__":
     unittest.main()

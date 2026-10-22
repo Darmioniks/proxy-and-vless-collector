@@ -75,6 +75,20 @@ jobs:
           total = len(unique_vless)
           print(f"\nTotal unique VLESS keys: {total}")
 
+          import os
+          if total == 0:
+              # Все источники недоступны: не затираем рабочий файл пустым.
+              print("Ни одного ключа не получено, vless.txt не изменён.")
+              raise SystemExit(0)
+          previous = set()
+          if os.path.exists("vless.txt"):
+              with open("vless.txt", encoding="utf-8") as f:
+                  previous = {line.strip() for line in f if line.strip().startswith("vless://")}
+          if previous == unique_vless:
+              # Заголовок с временем меняется при каждой записи, поэтому сравниваем только ключи.
+              print("Набор ключей не изменился, vless.txt не перезаписан.")
+              raise SystemExit(0)
+
           from datetime import datetime, timezone
           now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 

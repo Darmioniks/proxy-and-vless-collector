@@ -50,6 +50,13 @@ def load_source(url, timeout=12):
     return extract_links(response.text)
 
 
+def _tcp_public(host, port):
+    """TCP ping for public servers only: names that resolve to local addresses are skipped."""
+    if checker.resolves_private(host):
+        return None
+    return checker.check_tcp(host, port)
+
+
 def scan(limit=80, workers=100):
     source_counts = {}
     candidates = []
@@ -66,6 +73,8 @@ def scan(limit=80, workers=100):
 
     unique = {}
     for item in candidates:
+        if checker.is_private_host(item["host"]):
+            continue
         unique.setdefault((item["host"], item["port"]), item)
     candidates = list(unique.values())
     random.shuffle(candidates)
@@ -75,7 +84,7 @@ def scan(limit=80, workers=100):
     if subset:
         with ThreadPoolExecutor(max_workers=min(workers, len(subset))) as executor:
             futures = {
-                executor.submit(checker.check_tcp, item["host"], item["port"]): item
+                executor.submit(_tcp_public, item["host"], item["port"]): item
                 for item in subset
             }
             for future in as_completed(futures):
