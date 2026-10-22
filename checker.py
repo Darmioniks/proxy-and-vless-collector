@@ -443,7 +443,12 @@ def vless_to_outbound(info):
             "headers": {"Host": p.get("host", info["host"])},
         }
     elif network == "grpc":
-        stream["grpcSettings"] = {"serviceName": p.get("serviceName", "")}
+        # Authority and Host name the server, not the address: with a pinned IP, Xray would
+        # otherwise send the IP as Host/:authority (wrong behind CDNs).
+        stream["grpcSettings"] = {
+            "serviceName": p.get("serviceName", ""),
+            "authority": p.get("authority") or p.get("host") or p.get("sni") or info["host"],
+        }
     elif network == "tcp" and p.get("headerType") == "http":
         stream["tcpSettings"] = {
             "header": {"type": "http", "request": {
@@ -453,7 +458,7 @@ def vless_to_outbound(info):
     elif network == "xhttp":
         settings = {
             "path": _path_value(p.get("path"), "/"),
-            "host": p.get("host", ""),
+            "host": p.get("host") or p.get("sni") or info["host"],
         }
         mode = p.get("mode", "")
         if mode in XHTTP_MODES:
