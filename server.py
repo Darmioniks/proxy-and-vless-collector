@@ -20,6 +20,7 @@ app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), na
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 store.init_db()
 store.purge_stale_working()
+store.purge_expired_subscriptions()
 
 
 class Filters(BaseModel):
