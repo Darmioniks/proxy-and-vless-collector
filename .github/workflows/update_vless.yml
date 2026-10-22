@@ -72,8 +72,9 @@ jobs:
           if answered < len(SOURCES) // 2:
               print(f"Ответили только {answered} из {len(SOURCES)} источников, vless.txt не изменён.")
               raise SystemExit(0)
-          if previous and total < len(previous) * 0.5:
-              print(f"Ключей стало {total} вместо {len(previous)}, vless.txt не изменён.")
+          # Если ответили все источники, сокращение списка считаем настоящим и публикуем его.
+          if answered < len(SOURCES) and previous and total < len(previous) * 0.5:
+              print(f"Часть источников не ответила, ключей стало {total} вместо {len(previous)}, vless.txt не изменён.")
               raise SystemExit(0)
           if previous == unique_vless:
               # Заголовок с временем меняется при каждой записи, поэтому сравниваем только ключи.

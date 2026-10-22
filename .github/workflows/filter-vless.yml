@@ -56,7 +56,7 @@ jobs:
           infos = checker.parse_text(open("vless_filtered.txt", encoding="utf-8").read())
           seen = {}
           for info in infos:
-              if checker.is_private_host(info["host"]) or checker.resolve_pinned(info["host"]) is None:
+              if checker.is_private_host(info["host"]):
                   continue
               seen.setdefault(checker.key_identity(info), info)
           with open("vless_filtered.txt", "w", encoding="utf-8") as fh:

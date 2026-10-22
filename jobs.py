@@ -57,7 +57,6 @@ class Job:
         self.tcp_cache = checker.CheckCache()
         self.tls_cache = checker.CheckCache()
         self.dns_cache = checker.CheckCache()
-        self.xray_stop = threading.Event()
         self.emit("created", {"message": self.message})
 
     def _append(self, kind, data=None):
@@ -113,7 +112,6 @@ class Job:
 
     def stop(self):
         self.stop_event.set()
-        self.xray_stop.set()
         self.emit("stopping", {"message": "Останавливаю новые проверки"})
 
     def _load(self):
@@ -277,8 +275,8 @@ class Job:
                         xray_pending.discard(fut)
                         self._count(*fut.result())
         finally:
-            # Running Xray checks end at their next check point instead of running out their timeouts.
-            self.xray_stop.set()
+            # Running Xray checks are waited for (bounded by their own timeouts) so that the
+            # working keys they find are saved; only a user stop skips the wait.
             for fut in probe_pending | xray_pending:
                 fut.cancel()
             wait_for_running = not self.stop_event.is_set()
@@ -305,9 +303,9 @@ class Job:
             return "stopped", None
         ping = tcp
         if self.cfg["enable_xray"]:
-            ping = checker.check_xray(info, self.cfg["test_url"], stop_event=self.xray_stop)
+            ping = checker.check_xray(info, self.cfg["test_url"], stop_event=self.stop_event)
             if ping is None:
-                return "stopped" if self.xray_stop.is_set() else "xray_failed", None
+                return "stopped" if self.stop_event.is_set() else "xray_failed", None
         item = {"info": info, "ping": ping, "speed": None}
         item["score"] = checker.score(info, ping)
         return "found", item

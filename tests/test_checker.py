@@ -120,6 +120,19 @@ class NetworkRulesTest(unittest.TestCase):
         self.assertFalse(checker._acquire_xray_slot(stop))
 
 
+class PinnedAddressTest(unittest.TestCase):
+    def test_host_headers_keep_the_name_when_address_is_pinned(self):
+        info = dict(checker.parse_vless(key("security=none&type=xhttp&path=/x")), connect_host="203.0.113.7")
+        outbound = checker.vless_to_outbound(info)
+        self.assertEqual(outbound["settings"]["vnext"][0]["address"], "203.0.113.7")
+        self.assertEqual(outbound["streamSettings"]["xhttpSettings"]["host"], "good.example")
+
+    def test_grpc_authority_defaults_to_the_name(self):
+        info = dict(checker.parse_vless(key("security=none&type=grpc&serviceName=svc")), connect_host="203.0.113.7")
+        outbound = checker.vless_to_outbound(info)
+        self.assertEqual(outbound["streamSettings"]["grpcSettings"]["authority"], "good.example")
+
+
 class UriDecodingTest(unittest.TestCase):
     def parse(self, query):
         return checker.parse_vless(key(query))
